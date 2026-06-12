@@ -1,0 +1,9 @@
+FROM workflow-base:latest
+
+WORKDIR /app
+
+COPY app ./app
+
+EXPOSE 7000
+
+CMD ["python", "-m", "app.mcp.servers.calendar_server"]

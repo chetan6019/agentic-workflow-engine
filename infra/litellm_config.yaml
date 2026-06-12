@@ -1,0 +1,146 @@
+model_list:
+  # ---- Planner (default): gpt-oss-120b primary, gpt-oss-20b fallback ----
+  - model_name: planner-default
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 30
+  - model_name: planner-default
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 30
+
+  # ---- Planner (escalation) ----
+  - model_name: planner-escalation
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 60
+  - model_name: planner-escalation
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 60
+
+  # ---- Composer ----
+  - model_name: composer
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 30
+  - model_name: composer
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 30
+
+  # ---- Retriever grader ----
+  - model_name: retriever-grader
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+  - model_name: retriever-grader
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+
+  # ---- Retriever rewriter ----
+  - model_name: retriever-rewriter
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+  - model_name: retriever-rewriter
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+
+  # ---- Guardrails judge ----
+  - model_name: guard-judge
+    litellm_params:
+      model: groq/openai/gpt-oss-120b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+  - model_name: guard-judge
+    litellm_params:
+      model: groq/openai/gpt-oss-20b
+      api_key: os.environ/GROQ_API_KEY
+      timeout: 20
+
+  # ---- Cross-provider fallbacks ----
+  # Reached only via router_settings.fallbacks below, never in the primary
+  # rotation — so a Groq TPM/outage failover lands on a different provider
+  # instead of the other (same-org, same-limit) Groq model.
+  - model_name: gemini-fallback
+    litellm_params:
+      model: gemini/gemini-2.5-flash
+      api_key: os.environ/GEMINI_API_KEY
+      timeout: 30
+  - model_name: openai-fallback
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_key: os.environ/OPENAI_API_KEY
+      timeout: 30
+
+  # ---- Embeddings: local TEI container (no auth, no external dependency) ----
+  # Note: the HF Inference Provider router requires a token with that scope,
+  # which the current HF_TOKEN lacks (403). TEI is local and reliable.
+  - model_name: embed
+    litellm_params:
+      model: huggingface/BAAI/bge-base-en-v1.5
+      api_base: http://tei:80
+      timeout: 30
+
+litellm_settings:
+  set_verbose: false
+  drop_params: true
+  num_retries: 2
+  request_timeout: 60
+  # Langfuse tracing must be registered here as success/failure callbacks —
+  # a top-level `callbacks:` key is NOT recognized by LiteLLM.
+  success_callback: ["langfuse"]
+  failure_callback: ["langfuse"]
+
+router_settings:
+  routing_strategy: simple-shuffle
+  num_retries: 2
+  allowed_fails: 1
+  cooldown_time: 30
+  # When every Groq deployment for a model_name fails (e.g. TPM rate limit),
+  # fail over to a different provider — Gemini first, then OpenAI. Embeddings
+  # are intentionally excluded: a different provider would change the vector
+  # dimension and corrupt the Qdrant collections.
+  fallbacks:
+    - planner-default: ["gemini-fallback", "openai-fallback"]
+    - planner-escalation: ["gemini-fallback", "openai-fallback"]
+    - composer: ["gemini-fallback", "openai-fallback"]
+    - retriever-grader: ["gemini-fallback", "openai-fallback"]
+    - retriever-rewriter: ["gemini-fallback", "openai-fallback"]
+    - guard-judge: ["gemini-fallback", "openai-fallback"]
+
+cache:
+  type: redis
+  host: redis
+  port: 6379
+  db: 1
+  ttl:
+    planner-default: 600
+    planner-escalation: 600
+    composer: 300
+    retriever-grader: 900
+    retriever-rewriter: 900
+    guard-judge: 600
+    embed: 86400
+
+environment_variables:
+  LANGFUSE_PUBLIC_KEY: os.environ/LANGFUSE_PUBLIC_KEY
+  LANGFUSE_SECRET_KEY: os.environ/LANGFUSE_SECRET_KEY
+  LANGFUSE_HOST: os.environ/LANGFUSE_HOST
+  OPENAI_API_KEY: os.environ/OPENAI_API_KEY
+  GROQ_API_KEY: os.environ/GROQ_API_KEY
+  GEMINI_API_KEY: os.environ/GEMINI_API_KEY
+  HF_TOKEN: os.environ/HF_TOKEN

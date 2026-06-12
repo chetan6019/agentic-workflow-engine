@@ -1,0 +1,144 @@
+services:
+  # Build-only: produces the shared dependency image the Python services derive
+  # from. Never started at runtime (build profile). Build it before the rest:
+  #   docker compose build base
+  base:
+    build:
+      context: .
+      dockerfile: infra/Dockerfile.base
+    image: workflow-base:latest
+    profiles: ["build"]
+    command: ["python", "--version"]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: workflow
+    ports: ["5432:5432"]
+    volumes:
+      - "pgdata:/var/lib/postgresql/data"
+      - "./infra/postgres-init.sql:/docker-entrypoint-initdb.d/10-create-litellm-db.sql:ro"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    ports: ["6379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ["6333:6333"]
+    volumes: ["qdrantdata:/qdrant/storage"]
+
+  tei:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+    command: ["--model-id", "BAAI/bge-base-en-v1.5", "--port", "80"]
+    ports: ["8080:80"]
+    volumes: ["teidata:/data"]
+    environment:
+      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+  litellm-proxy:
+    image: ghcr.io/berriai/litellm:main-latest
+    command: ["--config", "/config.yaml", "--port", "4000"]
+    ports: ["4000:4000"]
+    volumes: ["./infra/litellm_config.yaml:/config.yaml:ro"]
+    env_file: .env
+    environment:
+      # Own database — LiteLLM's Prisma sync drops unknown tables, so it MUST NOT
+      # share the app's `workflow` DB (that wiped users/sessions on every restart).
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/litellm
+      # DEBUG dumps full request/response blobs on every call — keep INFO unless
+      # actively debugging LiteLLM internals.
+      LITELLM_LOG: INFO
+    depends_on: [postgres, redis, tei]
+
+  mcp-calendar:
+    build: { context: ., dockerfile: infra/Dockerfile.mcp }
+    init: true
+    command: ["python", "-m", "app.mcp.servers.calendar_server"]
+    ports: ["7001:7001"]
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  mcp-gmail:
+    build: { context: ., dockerfile: infra/Dockerfile.mcp }
+    init: true
+    command: ["python", "-m", "app.mcp.servers.gmail_server"]
+    ports: ["7002:7002"]
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  mcp-notion:
+    build: { context: ., dockerfile: infra/Dockerfile.mcp }
+    init: true
+    command: ["python", "-m", "app.mcp.servers.notion_server"]
+    ports: ["7003:7003"]
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  mcp-slack:
+    build: { context: ., dockerfile: infra/Dockerfile.mcp }
+    init: true
+    command: ["python", "-m", "app.mcp.servers.slack_server"]
+    ports: ["7004:7004"]
+    env_file: .env
+    depends_on: [postgres, redis]
+
+  api:
+    build: { context: ., dockerfile: infra/Dockerfile.api }
+    init: true
+    restart: on-failure
+    ports: ["8000:8000"]
+    env_file: .env
+    environment:
+      # Reach the MCP servers by their Docker service names, not localhost.
+      MCP_CALENDAR_URL: http://mcp-calendar:7001
+      MCP_GMAIL_URL: http://mcp-gmail:7002
+      MCP_NOTION_URL: http://mcp-notion:7003
+      MCP_SLACK_URL: http://mcp-slack:7004
+      TZ: ${TZ:-UTC}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      qdrant:
+        condition: service_started
+      litellm-proxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/readyz"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+
+  streamlit:
+    build: { context: ., dockerfile: infra/Dockerfile.streamlit }
+    init: true
+    ports: ["8501:8501"]
+    env_file: .env
+    environment:
+      TZ: ${TZ:-UTC}
+    depends_on: [api]
+
+volumes:
+  pgdata:
+  qdrantdata:
+  teidata:

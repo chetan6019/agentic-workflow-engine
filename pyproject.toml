@@ -1,0 +1,11 @@
+[project]
+name = "agentic-workflow-engine"
+version = "0.1.0"
+description = "AI Workflow Automation Engine — LangGraph + LiteLLM + Qdrant + MCP"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
