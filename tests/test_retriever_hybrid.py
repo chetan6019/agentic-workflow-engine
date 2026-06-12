@@ -101,11 +101,8 @@ async def test_dense_only_fallback_when_hybrid_disabled(monkeypatch, patch_embed
 
 async def test_retrieve_orders_by_fused_score(monkeypatch):
     """retrieve() must rank by fused_score, not cosine, and cap at the top-N."""
-    async def _yes(_state):
-        return True
-
-    async def _rw(req, _meta):
-        return req
+    async def _route(_state, _meta):
+        return retriever._RouteDecision(should_retrieve=True, query="do a thing")
 
     candidates = [
         retriever.RetrievedPlan(plan_id=str(i), request_text="r", plan_json={},
@@ -120,8 +117,7 @@ async def test_retrieve_orders_by_fused_score(monkeypatch):
     async def _grade_stub(cands, _req, _meta):
         return cands
 
-    monkeypatch.setattr(retriever, "_should_retrieve", _yes)
-    monkeypatch.setattr(retriever, "_rewrite_query", _rw)
+    monkeypatch.setattr(retriever, "_route_query", _route)
     monkeypatch.setattr(retriever, "_search", _search_stub)
     monkeypatch.setattr(retriever, "_grade", _grade_stub)
 
@@ -132,3 +128,39 @@ async def test_retrieve_orders_by_fused_score(monkeypatch):
 
     assert len(out) == retriever._TOP_N
     assert [p.plan_id for p in out] == ["6", "5", "4", "3", "2"]  # highest fused first
+
+
+async def test_route_query_falls_back_to_raw_request_on_llm_failure(monkeypatch):
+    """Router LLM failure must degrade to retrieving with the raw request."""
+    class _Boom:
+        async def ainvoke(self, _msgs):
+            raise RuntimeError("llm down")
+
+    monkeypatch.setattr(retriever, "get_structured_llm", lambda *a, **k: _Boom())
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s",
+                                 user_request="find my unread emails")
+
+    route = await retriever._route_query(state, {})
+
+    assert route.should_retrieve is True
+    assert route.query == "find my unread emails"
+
+
+async def test_retrieve_skips_search_when_router_says_no(monkeypatch):
+    """should_retrieve=False must short-circuit before any Qdrant search."""
+    async def _route(_state, _meta):
+        return retriever._RouteDecision(should_retrieve=False, query="q")
+
+    searched: list[int] = []
+
+    async def _search_stub(*_a, **_k):
+        searched.append(1)
+        return []
+
+    monkeypatch.setattr(retriever, "_route_query", _route)
+    monkeypatch.setattr(retriever, "_search", _search_stub)
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s",
+                                 user_request="hello there")
+
+    assert await retriever.retrieve(state) == []
+    assert searched == []

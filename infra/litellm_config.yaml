@@ -24,13 +24,6 @@ model_list:
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
 
-  # ---- Retriever rewriter ----
-  - model_name: retriever-rewriter
-    litellm_params:
-      model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 20
-
   # ---- Guardrails judge ----
   - model_name: guard-judge
     litellm_params:
@@ -99,7 +92,6 @@ router_settings:
     - planner-default: ["gemini-fallback", "openai-fallback"]
     - composer: ["gemini-fallback", "openai-fallback"]
     - retriever-grader: ["gemini-fallback", "openai-fallback"]
-    - retriever-rewriter: ["gemini-fallback", "openai-fallback"]
     - guard-judge: ["gemini-fallback", "openai-fallback"]
 
 environment_variables:
