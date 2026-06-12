@@ -104,7 +104,7 @@ async def test_retrieve_orders_by_fused_score(monkeypatch):
     async def _yes(_state):
         return True
 
-    async def _rw(req):
+    async def _rw(req, _meta):
         return req
 
     candidates = [
@@ -117,7 +117,7 @@ async def test_retrieve_orders_by_fused_score(monkeypatch):
     async def _search_stub(_query, _filters, k=10):
         return candidates
 
-    async def _grade_stub(cands, _req):
+    async def _grade_stub(cands, _req, _meta):
         return cands
 
     monkeypatch.setattr(retriever, "_should_retrieve", _yes)

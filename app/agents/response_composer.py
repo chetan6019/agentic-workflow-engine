@@ -11,7 +11,7 @@ from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 from app.config import get_settings
 from app.core.state import AgentState, DraftResponse, ToolSpec
-from app.llm.client import get_structured_llm
+from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_composer_messages, build_direct_answer_messages
 from app.rag.embedder import embed_text
 from app.rag.qdrant_client import DENSE_VECTOR, get_qdrant
@@ -109,7 +109,7 @@ async def _compose_direct_answer(state: AgentState, preferences: list[str]) -> D
         tool_specs=tool_specs,
         preferences=preferences,
     )
-    llm = get_structured_llm("composer", DraftResponse)
+    llm = get_structured_llm("composer", DraftResponse, run_metadata(state))
     try:
         draft: DraftResponse = await llm.ainvoke(messages)
     except _SCHEMA_ERRORS as exc:
@@ -153,7 +153,7 @@ async def compose(state: AgentState) -> DraftResponse:
         user_request=state.user_request,
         tz_name=get_settings().default_tz,
     )
-    llm = get_structured_llm("composer", DraftResponse)
+    llm = get_structured_llm("composer", DraftResponse, run_metadata(state))
     try:
         draft: DraftResponse = await llm.ainvoke(messages)
     except _SCHEMA_ERRORS as exc:

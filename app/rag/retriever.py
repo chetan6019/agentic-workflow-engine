@@ -18,7 +18,7 @@ from qdrant_client.http.models import (
 
 from app.config import get_settings
 from app.core.state import AgentState, RetrievedPlan
-from app.llm.client import get_llm, get_structured_llm
+from app.llm.client import get_llm, get_structured_llm, run_metadata
 from app.prompts import (
     build_retriever_grader_messages,
     build_retriever_rewriter_messages,
@@ -63,7 +63,7 @@ class _GraderOutput(BaseModel):
 async def _should_retrieve(state: AgentState) -> bool:
     """Cheap LLM gate to decide whether retrieval is worth running."""
     msgs = build_retriever_grader_messages(query=state.user_request, candidates=[])
-    llm = get_structured_llm("retriever-grader", _RetrieveDecision)
+    llm = get_structured_llm("retriever-grader", _RetrieveDecision, run_metadata(state))
     try:
         decision: _RetrieveDecision = await llm.ainvoke(msgs)
     except Exception:
@@ -71,10 +71,10 @@ async def _should_retrieve(state: AgentState) -> bool:
     return decision.should_retrieve
 
 
-async def _rewrite_query(user_request: str) -> str:
+async def _rewrite_query(user_request: str, metadata: dict[str, str]) -> str:
     """Rewrite the user request into a denser search query."""
     msgs = build_retriever_rewriter_messages(user_request=user_request)
-    llm = get_llm("retriever-rewriter")
+    llm = get_llm("retriever-rewriter", metadata)
     out = await llm.ainvoke(msgs)
     return (getattr(out, "content", None) or str(out)).strip() or user_request
 
@@ -174,12 +174,13 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     return plans
 
 
-async def _grade(candidates: list[RetrievedPlan], user_request: str) -> list[RetrievedPlan]:
+async def _grade(candidates: list[RetrievedPlan], user_request: str,
+                 metadata: dict[str, str]) -> list[RetrievedPlan]:
     """Ask the grader LLM to score candidates, drop ones below the threshold."""
     if not candidates:
         return []
     msgs = build_retriever_grader_messages(query=user_request, candidates=candidates)
-    llm = get_structured_llm("retriever-grader", _GraderOutput)
+    llm = get_structured_llm("retriever-grader", _GraderOutput, metadata)
     try:
         graded: _GraderOutput = await llm.ainvoke(msgs)
     except Exception:
@@ -193,13 +194,14 @@ async def retrieve(state: AgentState) -> list[RetrievedPlan]:
     if not await _should_retrieve(state):
         log.info("retrieve_skipped", trace_id=state.trace_id)
         return []
-    query = await _rewrite_query(state.user_request)
+    meta = run_metadata(state)
+    query = await _rewrite_query(state.user_request, meta)
     candidates = await _search(query, {"user_id": state.user_id, "success": True})
-    graded = await _grade(candidates, state.user_request)
+    graded = await _grade(candidates, state.user_request, meta)
     log.info("retrieve_user_scoped", candidates=len(candidates), graded=len(graded))
     if len(graded) < _MIN_AFTER_GRADE:
         broad = await _search(query, {"success": True})
-        graded = await _grade(broad, state.user_request)
+        graded = await _grade(broad, state.user_request, meta)
         log.info("retrieve_broadened", candidates=len(broad), graded=len(graded))
     # Order by the fused score so RRF's blend wins; in dense-only mode fused_score
     # equals the cosine, so this stays correct either way.
