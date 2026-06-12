@@ -1,37 +1,19 @@
 model_list:
-  # ---- Planner (default): gpt-oss-120b primary, gpt-oss-20b fallback ----
-  - model_name: planner-default
-    litellm_params:
-      model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 30
-  - model_name: planner-default
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 30
+  # Exactly ONE deployment per model_name. With routing_strategy simple-shuffle,
+  # a second same-name deployment is load-balanced (randomly picked), NOT a
+  # fallback — degradation must go through router_settings.fallbacks below.
 
-  # ---- Planner (escalation) ----
-  - model_name: planner-escalation
+  # ---- Planner (default) ----
+  - model_name: planner-default
     litellm_params:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
-      timeout: 60
-  - model_name: planner-escalation
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 60
+      timeout: 30
 
   # ---- Composer ----
   - model_name: composer
     litellm_params:
       model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 30
-  - model_name: composer
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
       timeout: 30
 
@@ -41,21 +23,11 @@ model_list:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
-  - model_name: retriever-grader
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 20
 
   # ---- Retriever rewriter ----
   - model_name: retriever-rewriter
     litellm_params:
       model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 20
-  - model_name: retriever-rewriter
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
 
@@ -65,16 +37,11 @@ model_list:
       model: groq/openai/gpt-oss-120b
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
-  - model_name: guard-judge
-    litellm_params:
-      model: groq/openai/gpt-oss-20b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 20
 
   # ---- Cross-provider fallbacks ----
   # Reached only via router_settings.fallbacks below, never in the primary
-  # rotation — so a Groq TPM/outage failover lands on a different provider
-  # instead of the other (same-org, same-limit) Groq model.
+  # rotation — a Groq TPM/outage failover lands on a different provider
+  # rather than another same-org, same-limit Groq deployment.
   - model_name: gemini-fallback
     litellm_params:
       model: gemini/gemini-2.5-flash
@@ -116,7 +83,6 @@ router_settings:
   # dimension and corrupt the Qdrant collections.
   fallbacks:
     - planner-default: ["gemini-fallback", "openai-fallback"]
-    - planner-escalation: ["gemini-fallback", "openai-fallback"]
     - composer: ["gemini-fallback", "openai-fallback"]
     - retriever-grader: ["gemini-fallback", "openai-fallback"]
     - retriever-rewriter: ["gemini-fallback", "openai-fallback"]
@@ -129,7 +95,6 @@ cache:
   db: 1
   ttl:
     planner-default: 600
-    planner-escalation: 600
     composer: 300
     retriever-grader: 900
     retriever-rewriter: 900

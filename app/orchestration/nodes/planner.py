@@ -3,10 +3,13 @@
 from __future__ import annotations
 
 import datetime
+from json import JSONDecodeError
 from typing import Any
 from zoneinfo import ZoneInfo
 
 import structlog
+from langchain_core.exceptions import OutputParserException
+from pydantic import ValidationError
 
 from app.config import get_settings
 from app.core.state import AgentState, ExecutionPlan, ToolSpec
@@ -18,6 +21,12 @@ from app.rag.qdrant_client import DENSE_VECTOR, get_qdrant
 log = structlog.get_logger(__name__)
 _TOOL_DOC_COLLECTION = "tool_capability_docs"
 _TOOL_DOC_K = 6
+# Schema/JSON failures = the LLM responded but the body was malformed — a
+# *successful* HTTP call the LiteLLM gateway will not retry, so retry once
+# locally. Transport errors (rate limit, timeout, network) are already retried
+# by the gateway (num_retries) and its cross-provider fallbacks; when those are
+# exhausted the run fails honestly. Same split as guard.py / response_composer.py.
+_SCHEMA_ERRORS = (ValidationError, JSONDecodeError, OutputParserException)
 
 
 async def _fetch_tool_specs(user_request: str) -> list[ToolSpec]:
@@ -77,23 +86,18 @@ async def planner_node(state: AgentState) -> AgentState:
 
     try:
         plan = await _invoke_planner("planner-default", messages)
-    except Exception as first_exc:
-        log.warning("planner_default_retry", error=str(first_exc))
+    except _SCHEMA_ERRORS as schema_exc:
+        log.warning("planner_schema_retry", error=str(schema_exc))
         try:
             plan = await _invoke_planner("planner-default", messages)
         except Exception as exc:
             log.error("planner_failed", error=str(exc))
             state.error = f"planner_structured_output_failed: {exc!s}"
             return state
-
-    if plan.complexity_score > 6:
-        log.info("planner_escalating", complexity=plan.complexity_score)
-        try:
-            plan = await _invoke_planner("planner-escalation", messages)
-        except Exception as exc:
-            log.error("planner_escalation_failed", error=str(exc))
-            state.error = f"planner_escalation_failed: {exc!s}"
-            return state
+    except Exception as exc:
+        log.error("planner_failed", error=str(exc))
+        state.error = f"planner_failed: {exc!s}"
+        return state
 
     state.plan = plan
     log.info("planner_node_done", steps=len(plan.steps), strategy=plan.strategy,
