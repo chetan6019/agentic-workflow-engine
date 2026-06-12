@@ -24,13 +24,6 @@ model_list:
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
 
-  # ---- Retriever rewriter ----
-  - model_name: retriever-rewriter
-    litellm_params:
-      model: groq/openai/gpt-oss-120b
-      api_key: os.environ/GROQ_API_KEY
-      timeout: 20
-
   # ---- Guardrails judge ----
   - model_name: guard-judge
     litellm_params:
@@ -71,6 +64,20 @@ litellm_settings:
   # a top-level `callbacks:` key is NOT recognized by LiteLLM.
   success_callback: ["langfuse"]
   failure_callback: ["langfuse"]
+  # Response caching. Same pitfall as callbacks above: this must live under
+  # litellm_settings as cache/cache_params — a top-level `cache:` key is
+  # silently ignored by the proxy. One flat TTL: per-model TTL maps are not
+  # a supported shape. db 1 keeps proxy entries out of the app's Redis db 0.
+  # Chat completions only — embeddings already have a 24h app-side cache in
+  # app/rag/embedder.py, so proxy-caching them would just duplicate entries.
+  cache: true
+  cache_params:
+    type: redis
+    host: redis
+    port: 6379
+    db: 1
+    ttl: 600
+    supported_call_types: ["completion", "acompletion"]
 
 router_settings:
   routing_strategy: simple-shuffle
@@ -85,21 +92,7 @@ router_settings:
     - planner-default: ["gemini-fallback", "openai-fallback"]
     - composer: ["gemini-fallback", "openai-fallback"]
     - retriever-grader: ["gemini-fallback", "openai-fallback"]
-    - retriever-rewriter: ["gemini-fallback", "openai-fallback"]
     - guard-judge: ["gemini-fallback", "openai-fallback"]
-
-cache:
-  type: redis
-  host: redis
-  port: 6379
-  db: 1
-  ttl:
-    planner-default: 600
-    composer: 300
-    retriever-grader: 900
-    retriever-rewriter: 900
-    guard-judge: 600
-    embed: 86400
 
 environment_variables:
   LANGFUSE_PUBLIC_KEY: os.environ/LANGFUSE_PUBLIC_KEY

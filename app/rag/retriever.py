@@ -1,4 +1,4 @@
-"""Agentic RAG retriever: decide → rewrite → search → grade (with broadening fallback)."""
+"""Agentic RAG retriever: route (decide+rewrite) → search → grade (with broadening fallback)."""
 
 from __future__ import annotations
 
@@ -18,10 +18,10 @@ from qdrant_client.http.models import (
 
 from app.config import get_settings
 from app.core.state import AgentState, RetrievedPlan
-from app.llm.client import get_llm, get_structured_llm
+from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import (
     build_retriever_grader_messages,
-    build_retriever_rewriter_messages,
+    build_retriever_router_messages,
 )
 from app.rag.embedder import embed_sparse, embed_text
 from app.rag.qdrant_client import DENSE_VECTOR, SPARSE_VECTOR, get_qdrant
@@ -34,13 +34,13 @@ _MIN_AFTER_GRADE = 3
 _RELEVANCE_THRESHOLD = 0.7
 
 
-class _RetrieveDecision(BaseModel):
-    """Structured yes/no decision from the retriever-grader."""
+class _RouteDecision(BaseModel):
+    """Combined should-retrieve gate + rewritten search query (one LLM call)."""
 
     model_config = ConfigDict(extra="forbid")
 
-    should_retrieve: bool = Field(description="True if retrieval would help.")
-    reason: str = Field(description="One-line rationale.")
+    should_retrieve: bool = Field(description="True if past-plan retrieval would help.")
+    query: str = Field(description="Concise keyword-rich search query.")
 
 
 class _GradedHit(BaseModel):
@@ -60,23 +60,24 @@ class _GraderOutput(BaseModel):
     hits: list[_GradedHit] = Field(description="Per-candidate grades.")
 
 
-async def _should_retrieve(state: AgentState) -> bool:
-    """Cheap LLM gate to decide whether retrieval is worth running."""
-    msgs = build_retriever_grader_messages(query=state.user_request, candidates=[])
-    llm = get_structured_llm("retriever-grader", _RetrieveDecision)
+async def _route_query(state: AgentState, metadata: dict[str, str]) -> _RouteDecision:
+    """One structured call: decide IF retrieval helps AND rewrite the search query.
+
+    Replaces the old two-call decide → rewrite preamble, removing one LLM
+    round-trip from every request's critical path. On any LLM failure, fall
+    back to retrieving with the raw request — retrieval is best-effort and
+    must never be run-fatal.
+    """
+    msgs = build_retriever_router_messages(user_request=state.user_request)
+    llm = get_structured_llm("retriever-grader", _RouteDecision, metadata)
     try:
-        decision: _RetrieveDecision = await llm.ainvoke(msgs)
-    except Exception:
-        return True
-    return decision.should_retrieve
-
-
-async def _rewrite_query(user_request: str) -> str:
-    """Rewrite the user request into a denser search query."""
-    msgs = build_retriever_rewriter_messages(user_request=user_request)
-    llm = get_llm("retriever-rewriter")
-    out = await llm.ainvoke(msgs)
-    return (getattr(out, "content", None) or str(out)).strip() or user_request
+        decision: _RouteDecision = await llm.ainvoke(msgs)
+    except Exception as exc:
+        log.warning("retrieve_route_fallback", error=str(exc))
+        return _RouteDecision(should_retrieve=True, query=state.user_request)
+    if not decision.query.strip():
+        decision.query = state.user_request
+    return decision
 
 
 def _build_filter(filters: dict[str, Any] | None) -> Filter | None:
@@ -141,6 +142,8 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     sparse = await embed_sparse(query)
     t1 = time.monotonic()
     client = get_qdrant()
+    # TODO(REVIEW.md R26): the fused and dense passes below run sequentially
+    # because QdrantClient is sync; switch to AsyncQdrantClient and gather them.
     fused = client.query_points(
         collection_name=_PLANS_COLLECTION,
         prefetch=[
@@ -174,12 +177,13 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     return plans
 
 
-async def _grade(candidates: list[RetrievedPlan], user_request: str) -> list[RetrievedPlan]:
+async def _grade(candidates: list[RetrievedPlan], user_request: str,
+                 metadata: dict[str, str]) -> list[RetrievedPlan]:
     """Ask the grader LLM to score candidates, drop ones below the threshold."""
     if not candidates:
         return []
     msgs = build_retriever_grader_messages(query=user_request, candidates=candidates)
-    llm = get_structured_llm("retriever-grader", _GraderOutput)
+    llm = get_structured_llm("retriever-grader", _GraderOutput, metadata)
     try:
         graded: _GraderOutput = await llm.ainvoke(msgs)
     except Exception:
@@ -190,16 +194,17 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str) -> list[Ret
 
 async def retrieve(state: AgentState) -> list[RetrievedPlan]:
     """Run the agentic retrieval loop and return up to 5 graded RetrievedPlans."""
-    if not await _should_retrieve(state):
+    meta = run_metadata(state)
+    route = await _route_query(state, meta)
+    if not route.should_retrieve:
         log.info("retrieve_skipped", trace_id=state.trace_id)
         return []
-    query = await _rewrite_query(state.user_request)
-    candidates = await _search(query, {"user_id": state.user_id, "success": True})
-    graded = await _grade(candidates, state.user_request)
+    candidates = await _search(route.query, {"user_id": state.user_id, "success": True})
+    graded = await _grade(candidates, state.user_request, meta)
     log.info("retrieve_user_scoped", candidates=len(candidates), graded=len(graded))
     if len(graded) < _MIN_AFTER_GRADE:
-        broad = await _search(query, {"success": True})
-        graded = await _grade(broad, state.user_request)
+        broad = await _search(route.query, {"success": True})
+        graded = await _grade(broad, state.user_request, meta)
         log.info("retrieve_broadened", candidates=len(broad), graded=len(graded))
     # Order by the fused score so RRF's blend wins; in dense-only mode fused_score
     # equals the cosine, so this stays correct either way.

@@ -43,16 +43,21 @@ Example — send an email:
  "arguments":{"to":"a@b.com","subject":"Hi","body":"Hello"},"depends_on":[]}
 </output_format>"""
 
-_RETRIEVER_REWRITER_SYS = """<instructions>
-Rewrite the user query into a concise, keyword-rich search query for semantic retrieval of past workflow plans.
-Output only the rewritten query string.
+_RETRIEVER_ROUTER_SYS = """<instructions>
+You are the retrieval router for a workflow planner.
+In ONE pass: decide whether searching past workflow plans would help fulfil the
+request, AND rewrite the request into a concise, keyword-rich search query for
+semantic retrieval. Retrieval helps for task-like requests (calendar, email,
+Notion, Slack actions); it does not help for greetings, meta questions, or
+small talk.
+Output JSON: {"should_retrieve": bool, "query": str}.
+`query` must always be filled, even when should_retrieve is false.
 </instructions>"""
 
 _RETRIEVER_GRADER_SYS = """<instructions>
 You are a relevance grader for workflow plan retrieval.
-When candidates is empty: decide if retrieval is needed at all (output JSON: {"should_retrieve": bool, "reason": str}).
-When candidates are provided: score each candidate for relevance to the query
-(output JSON: {"hits": [{"plan_id": str, "relevance": float}]}).
+Score each candidate for relevance to the query, 0.0 (unrelated) to 1.0 (same task).
+Output JSON: {"hits": [{"plan_id": str, "relevance": float}]}.
 </instructions>"""
 
 _GUARD_SYS = """<instructions>
@@ -143,19 +148,16 @@ def build_planner_messages(user_request: str, examples: list[Any], tool_specs: l
     return [SystemMessage(content=_PLANNER_SYS), HumanMessage(content=human)]
 
 
-def build_retriever_rewriter_messages(user_request: str) -> list[BaseMessage]:
-    """Build query-rewrite prompt for the retriever."""
-    return [SystemMessage(content=_RETRIEVER_REWRITER_SYS),
+def build_retriever_router_messages(user_request: str) -> list[BaseMessage]:
+    """Build the combined should-retrieve + query-rewrite prompt (one LLM call)."""
+    return [SystemMessage(content=_RETRIEVER_ROUTER_SYS),
             HumanMessage(content=f"<request>\n{user_request}\n</request>")]
 
 
 def build_retriever_grader_messages(query: str, candidates: list[Any]) -> list[BaseMessage]:
-    """Build grader prompt; handles empty candidates (should-retrieve) and populated lists (relevance scoring)."""
-    if not candidates:
-        human = f"<request>\n{query}\n</request>\n<candidates>\n[]\n</candidates>"
-    else:
-        cands = json.dumps([c.model_dump() if hasattr(c, "model_dump") else c for c in candidates])
-        human = f"<request>\n{query}\n</request>\n<candidates>\n{cands}\n</candidates>"
+    """Build grader prompt scoring each candidate's relevance to the query."""
+    cands = json.dumps([c.model_dump() if hasattr(c, "model_dump") else c for c in candidates])
+    human = f"<request>\n{query}\n</request>\n<candidates>\n{cands}\n</candidates>"
     return [SystemMessage(content=_RETRIEVER_GRADER_SYS), HumanMessage(content=human)]
 
 

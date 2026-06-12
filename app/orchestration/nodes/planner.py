@@ -13,7 +13,7 @@ from pydantic import ValidationError
 
 from app.config import get_settings
 from app.core.state import AgentState, ExecutionPlan, ToolSpec
-from app.llm.client import get_structured_llm
+from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_planner_messages
 from app.rag.embedder import embed_text
 from app.rag.qdrant_client import DENSE_VECTOR, get_qdrant
@@ -62,9 +62,10 @@ def _weekday_reference(now: datetime.datetime) -> str:
     return f"Today is {today.strftime('%A')} {today.isoformat()}.\n" + "\n".join(lines)
 
 
-async def _invoke_planner(role: str, messages: list[Any]) -> ExecutionPlan:
+async def _invoke_planner(role: str, messages: list[Any],
+                          metadata: dict[str, str]) -> ExecutionPlan:
     """Call the planner LLM with structured output and return an ExecutionPlan."""
-    llm = get_structured_llm(role, ExecutionPlan)
+    llm = get_structured_llm(role, ExecutionPlan, metadata)
     return await llm.ainvoke(messages)
 
 
@@ -84,12 +85,13 @@ async def planner_node(state: AgentState) -> AgentState:
         weekday_ref=_weekday_reference(now),
     )
 
+    meta = run_metadata(state)
     try:
-        plan = await _invoke_planner("planner-default", messages)
+        plan = await _invoke_planner("planner-default", messages, meta)
     except _SCHEMA_ERRORS as schema_exc:
         log.warning("planner_schema_retry", error=str(schema_exc))
         try:
-            plan = await _invoke_planner("planner-default", messages)
+            plan = await _invoke_planner("planner-default", messages, meta)
         except Exception as exc:
             log.error("planner_failed", error=str(exc))
             state.error = f"planner_structured_output_failed: {exc!s}"

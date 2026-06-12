@@ -12,7 +12,7 @@ from pydantic import ValidationError
 
 from app.core.state import AgentState, DraftResponse, GuardVerdict
 from app.data.repositories import create_approval, get_token, save_plan
-from app.llm.client import get_structured_llm
+from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_guard_judge_messages
 
 log = structlog.get_logger(__name__)
@@ -108,7 +108,7 @@ async def guardrails_node(state: AgentState) -> AgentState:
         return state
 
     messages = build_guard_judge_messages(draft=state.draft, user_request=state.user_request)
-    llm = get_structured_llm("guard-judge", GuardVerdict)
+    llm = get_structured_llm("guard-judge", GuardVerdict, run_metadata(state))
     try:
         verdict: GuardVerdict = await llm.ainvoke(messages)
     except _SCHEMA_ERRORS as exc:
