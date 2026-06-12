@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+
+jobs:
+  ci:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt ruff mypy
+
+      - name: Lint (ruff)
+        run: ruff check app/ streamlit_app/ scripts/ tests/
+
+      # Advisory until REVIEW.md R5 lands: config.py's os.getenv defaults
+      # legitimately fail strict typing today. Flip to gating once fixed.
+      - name: Type check (mypy, advisory)
+        run: mypy app/
+        continue-on-error: true
+
+      - name: Tests (pytest)
+        run: pytest -q
