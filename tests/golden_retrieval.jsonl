@@ -1,0 +1,21 @@
+{"query": "set up a daily standup for the team at 9 in the morning tomorrow", "expected_seed_requests": ["Schedule a team standup tomorrow at 9am"]}
+{"query": "reserve some focus time on friday afternoon", "expected_seed_requests": ["Block focus time this Friday afternoon"]}
+{"query": "when am I free for an hour with Alice this week", "expected_seed_requests": ["Find a free 1-hour slot with Alice this week"]}
+{"query": "move my 2pm tomorrow to 4pm", "expected_seed_requests": ["Reschedule tomorrow's 2pm meeting to 4pm"]}
+{"query": "what meetings do I have over the next 5 days", "expected_seed_requests": ["List my meetings for the next 5 days"]}
+{"query": "remove the cancelled Q3 review from my calendar", "expected_seed_requests": ["Delete the canceled Q3 review event"]}
+{"query": "book a 1:1 with my manager monday at 10", "expected_seed_requests": ["Schedule a 1:1 with my manager Monday 10am"]}
+{"query": "what unread mail do I have", "expected_seed_requests": ["Show my unread emails"]}
+{"query": "any linkedin job alerts this week", "expected_seed_requests": ["Show LinkedIn job alerts from this week"]}
+{"query": "pull up messages from john@example.com", "expected_seed_requests": ["Find emails from john@example.com"]}
+{"query": "email john the report", "expected_seed_requests": ["Send John the report"]}
+{"query": "write a draft follow-up to the client about the proposal", "expected_seed_requests": ["Draft a follow-up to the client about the proposal"]}
+{"query": "find Alice's email address", "expected_seed_requests": ["Find Alice's email"]}
+{"query": "show me emails with attachments from the past week", "expected_seed_requests": ["Find emails with attachments from last week"]}
+{"query": "make a notion page for the Q3 roadmap", "expected_seed_requests": ["Create a project page for the Q3 roadmap"]}
+{"query": "add the standup notes to the team wiki today", "expected_seed_requests": ["Add today's standup notes to the team wiki"]}
+{"query": "look up onboarding docs in notion", "expected_seed_requests": ["Search Notion for onboarding pages"]}
+{"query": "find notion pages about API design", "expected_seed_requests": ["Find all Notion pages about API design"]}
+{"query": "tell #engineering the release is tomorrow", "expected_seed_requests": ["Post a reminder to #engineering that release is tomorrow"]}
+{"query": "search slack for the payment bug", "expected_seed_requests": ["Search Slack for 'payment bug'"]}
+{"query": "list my slack channels", "expected_seed_requests": ["List all my Slack channels"]}
