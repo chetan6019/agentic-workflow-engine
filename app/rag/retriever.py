@@ -188,6 +188,14 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str,
         graded: _GraderOutput = await llm.ainvoke(msgs)
     except Exception:
         return candidates
+    # Emit per-candidate relevance + rank so retrieval quality is observable
+    # online (and joinable with feedback/eval offline — REVIEW.md R29). Ranked
+    # by the grader's own score, highest first; threshold drives the keep set.
+    ranked = sorted(graded.hits, key=lambda h: h.relevance, reverse=True)
+    log.info("retrieve_graded",
+             scores=[{"plan_id": h.plan_id, "relevance": round(h.relevance, 3),
+                      "rank": i + 1, "kept": h.relevance >= _RELEVANCE_THRESHOLD}
+                     for i, h in enumerate(ranked)])
     keep = {h.plan_id for h in graded.hits if h.relevance >= _RELEVANCE_THRESHOLD}
     return [c for c in candidates if c.plan_id in keep]
 
