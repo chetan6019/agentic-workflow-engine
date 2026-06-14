@@ -43,6 +43,9 @@ class Settings(BaseSettings):
     # Max requests per identity (user_id, or client IP when unauthenticated) per
     # 60s window, enforced in the API middleware. Override with RATE_LIMIT_PER_MIN.
     rate_limit_per_min: int = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+    # Hard ceiling on a single workflow run; a run exceeding it is marked
+    # run_timeout instead of hanging forever. Override with RUN_TIMEOUT_SEC.
+    run_timeout_sec: int = int(os.getenv("RUN_TIMEOUT_SEC", "120"))
 
 
 @lru_cache(maxsize=1)

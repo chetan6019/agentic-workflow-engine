@@ -11,6 +11,7 @@ import structlog
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from app.config import get_settings
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
 from app.data.repositories import create_session, get_plan_by_trace_id, save_plan
@@ -19,6 +20,12 @@ from app.orchestration.graph import compile_graph, discard_thread
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
 
+# Runs execute as in-process asyncio tasks on the instance that accepted /invoke;
+# they are NOT durable across a restart of that instance. Two guards bound the
+# blast radius: a per-run timeout (run_timeout_sec) marks a hung run failed in
+# process, and /invoke/result reconciles a run whose phase key has vanished
+# (worker gone) to a failed state. Approval RESUME is restart-tolerant because it
+# rebuilds from Postgres and can land on any instance.
 # Hold strong refs to background runs so they aren't garbage-collected mid-await
 # (asyncio only weakly references tasks; a dropped ref can cancel the run).
 _BG_TASKS: set[asyncio.Task] = set()
@@ -85,18 +92,27 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     config = {"configurable": {"thread_id": initial.trace_id}}
     log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
     started = time.monotonic()
-    final_state = initial
-    await _set_phase(initial.trace_id, "📥 retrieving context")
-    try:
+    holder = {"state": initial}  # mutable so a timeout still sees the latest state
+
+    async def _stream() -> None:
         async for chunk in compiled.astream(initial, config=config, stream_mode="values"):
             try:
-                final_state = AgentState.model_validate(chunk)
+                holder["state"] = AgentState.model_validate(chunk)
             except Exception:
                 continue
-            await _set_phase(initial.trace_id, _phase_label(final_state))
+            await _set_phase(initial.trace_id, _phase_label(holder["state"]))
+
+    await _set_phase(initial.trace_id, "📥 retrieving context")
+    try:
+        await asyncio.wait_for(_stream(), timeout=get_settings().run_timeout_sec)
+    except asyncio.TimeoutError:
+        log.error("workflow_run_timeout", trace_id=initial.trace_id,
+                  timeout_sec=get_settings().run_timeout_sec)
+        holder["state"].error = holder["state"].error or "run_timeout"
     except Exception as exc:
         log.exception("workflow_run_failed", trace_id=initial.trace_id, error=str(exc))
-        final_state.error = final_state.error or str(exc)
+        holder["state"].error = holder["state"].error or str(exc)
+    final_state = holder["state"]
     try:
         await save_plan(final_state)
     except Exception as exc:
@@ -147,11 +163,15 @@ async def invoke_phase(trace_id: str) -> dict:
 async def invoke_result(trace_id: str) -> dict:
     """Authoritative final state for a trace, read from the persisted plan.
 
-    The UI fetches this after the SSE stream so the answer survives missed frames.
-    The plan row is written mid-run (before the draft exists, to satisfy the
-    tool_calls FK), so we mark it 'done' once any reliable terminal signal is
-    present: an error, a populated draft, or a non-zero confidence (which only
-    gets set after guardrails runs, i.e. after the graph fully completes).
+    The UI polls this for the final answer. The plan row is written mid-run
+    (before the draft exists, to satisfy the tool_calls FK), so we mark it 'done'
+    once any reliable terminal signal is present: an error, a populated draft, or
+    a non-zero confidence (which only gets set after guardrails runs, i.e. after
+    the graph fully completes).
+
+    Reconciliation: if the row exists with no terminal signal AND the phase key
+    has vanished, the worker that owned this run is gone (e.g. instance restart);
+    report it failed rather than 'pending' forever.
     """
     row = await get_plan_by_trace_id(trace_id)
     if not row:
@@ -159,4 +179,10 @@ async def invoke_result(trace_id: str) -> dict:
     state = json.loads(row["state_json"])
     draft_md = (state.get("draft") or {}).get("detail_markdown")
     done = bool(draft_md) or bool(state.get("error")) or float(state.get("confidence") or 0) > 0
-    return {"status": "done" if done else "pending", "state": state}
+    if done:
+        return {"status": "done", "state": state}
+    if not await get_redis().get(_PHASE_KEY.format(trace_id=trace_id)):
+        log.warning("run_reconciled_failed", trace_id=trace_id)
+        state["error"] = state.get("error") or "instance_restarted"
+        return {"status": "failed", "state": state}
+    return {"status": "pending", "state": state}
