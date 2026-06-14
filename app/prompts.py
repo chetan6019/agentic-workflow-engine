@@ -9,6 +9,18 @@ from langchain_core.messages import BaseMessage, HumanMessage, SystemMessage
 
 # Full email bodies are the main driver of oversized composer prompts; trim them.
 _COMPOSER_BODY_LIMIT = 300
+# Retrieved past-plan text (request + summary) can come from OTHER users after the
+# retriever broadens its search, so it is untrusted input. Clip its length and
+# neutralise prompt-tag characters before it nears the planner instructions (R33).
+_RETRIEVED_TEXT_LIMIT = 300
+
+
+def _sanitize_retrieved(text: Any) -> str:
+    """Clip length and escape angle brackets in untrusted retrieved text (R33)."""
+    s = str(text or "")
+    if len(s) > _RETRIEVED_TEXT_LIMIT:
+        s = s[:_RETRIEVED_TEXT_LIMIT] + "…"
+    return s.replace("<", "‹").replace(">", "›")
 
 _PLANNER_SYS = """<instructions>
 You are a workflow planner. Given a user request, retrieved similar plans, and available tools,
@@ -133,11 +145,12 @@ def _slim_tool_specs(tool_specs: list[Any]) -> list[dict[str, Any]]:
 
 
 def _slim_examples(examples: list[Any]) -> list[dict[str, Any]]:
-    """Keep only request + summary from retrieved plans; the full plan_json bloats the prompt."""
+    """Keep only request + summary from retrieved plans, sanitized (untrusted, R33)."""
     out: list[dict[str, Any]] = []
     for e in examples[:3]:
         d = e.model_dump() if hasattr(e, "model_dump") else dict(e)
-        out.append({"request": d.get("request_text"), "summary": d.get("summary")})
+        out.append({"request": _sanitize_retrieved(d.get("request_text")),
+                    "summary": _sanitize_retrieved(d.get("summary"))})
     return out
 
 
