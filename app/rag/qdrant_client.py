@@ -5,7 +5,7 @@ from __future__ import annotations
 import structlog
 from functools import lru_cache
 
-from qdrant_client import QdrantClient
+from qdrant_client import AsyncQdrantClient
 from qdrant_client.http.models import (
     Distance,
     HnswConfigDiff,
@@ -32,20 +32,20 @@ _HNSW = HnswConfigDiff(m=16)
 
 
 @lru_cache(maxsize=1)
-def get_qdrant() -> QdrantClient:
-    """Return the cached Qdrant client."""
+def get_qdrant() -> AsyncQdrantClient:
+    """Return the cached async Qdrant client (non-blocking query/upsert)."""
     url = get_settings().qdrant_url
     log.debug("qdrant_client_created", url=url)
-    return QdrantClient(url=url)
+    return AsyncQdrantClient(url=url)
 
 
-def ensure_collections() -> None:
+async def ensure_collections() -> None:
     """Idempotently create all required Qdrant collections if they don't exist."""
     client = get_qdrant()
-    existing = {c.name for c in client.get_collections().collections}
+    existing = {c.name for c in (await client.get_collections()).collections}
     for name in _COLLECTIONS:
         if name not in existing:
-            client.create_collection(
+            await client.create_collection(
                 collection_name=name,
                 vectors_config={
                     DENSE_VECTOR: VectorParams(
@@ -59,7 +59,7 @@ def ensure_collections() -> None:
             log.debug("qdrant_collection_exists", name=name)
 
 
-def recreate_collections(names: list[str] | None = None) -> None:
+async def recreate_collections(names: list[str] | None = None) -> None:
     """Drop the given collections (default: all) and recreate them with the current schema.
 
     Destructive: existing points are lost. Use after a schema change — e.g. the switch
@@ -69,8 +69,8 @@ def recreate_collections(names: list[str] | None = None) -> None:
     client = get_qdrant()
     for name in names or _COLLECTIONS:
         try:
-            client.delete_collection(name)
+            await client.delete_collection(name)
             log.info("qdrant_collection_dropped", name=name)
         except Exception as exc:
             log.debug("qdrant_collection_drop_skipped", name=name, error=str(exc))
-    ensure_collections()
+    await ensure_collections()

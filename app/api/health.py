@@ -39,7 +39,7 @@ async def readyz() -> JSONResponse:
         log.error("readyz_redis_fail", error=str(exc))
 
     try:
-        get_qdrant().get_collections()
+        await get_qdrant().get_collections()
     except Exception as exc:
         errors.append(f"qdrant: {exc}")
         log.error("readyz_qdrant_fail", error=str(exc))

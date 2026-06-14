@@ -26,9 +26,9 @@ async def fetch_tool_specs(query: str, k: int) -> list[ToolSpec]:
     """
     try:
         vec = await embed_text(query)
-        hits = get_qdrant().query_points(
+        hits = (await get_qdrant().query_points(
             collection_name=_TOOL_DOC_COLLECTION, query=vec, using=DENSE_VECTOR, limit=k
-        ).points
+        )).points
     except Exception as exc:
         log.warning("tool_specs_fetch_failed", error=str(exc))
         return []

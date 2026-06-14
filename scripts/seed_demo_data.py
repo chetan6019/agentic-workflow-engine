@@ -130,7 +130,7 @@ async def main() -> None:
     await init_db()
     # Drop + recreate so the named dense+sparse schema replaces any old single-vector
     # collections left over from before hybrid search.
-    recreate_collections(["plans", "preferences"])
+    await recreate_collections(["plans", "preferences"])
 
     existing = await get_user_by_username(_DEMO_USER)
     user_id = (existing["id"] if existing
@@ -148,7 +148,7 @@ async def main() -> None:
             "plan_id": pid, "request_text": req, "summary": summary,
             "plan_json": plan_json, "user_id": user_id, "success": True,
         }))
-    client.upsert(collection_name="plans", points=points)
+    await client.upsert(collection_name="plans", points=points)
     print(f"Seeded {len(points)} demo plans into Qdrant.")
 
 

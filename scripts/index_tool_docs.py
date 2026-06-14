@@ -40,11 +40,11 @@ async def main() -> None:
     qdrant = get_qdrant()
     # Start clean so stale/junk entries from earlier runs are removed.
     try:
-        qdrant.delete_collection("tool_capability_docs")
+        await qdrant.delete_collection("tool_capability_docs")
         log.info("tool_docs_collection_cleared")
     except Exception as exc:
         log.debug("tool_docs_collection_clear_skipped", error=str(exc))
-    ensure_collections()
+    await ensure_collections()
     mcp = get_mcp_client()
     points: list[PointStruct] = []
 
@@ -67,7 +67,7 @@ async def main() -> None:
             log.debug("tool_doc_indexed", name=spec.name, server=server)
 
     if points:
-        qdrant.upsert(collection_name="tool_capability_docs", points=points)
+        await qdrant.upsert(collection_name="tool_capability_docs", points=points)
     print(f"Indexed {len(points)} tool docs into Qdrant.")
 
 

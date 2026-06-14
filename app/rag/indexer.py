@@ -32,5 +32,5 @@ async def index_plan(state: AgentState) -> None:
             "success": state.error is None,
         },
     )
-    get_qdrant().upsert(collection_name="plans", points=[point])
+    await get_qdrant().upsert(collection_name="plans", points=[point])
     log.info("plan_indexed", trace_id=state.trace_id)

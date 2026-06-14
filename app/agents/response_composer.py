@@ -32,13 +32,13 @@ async def _fetch_preferences(state: AgentState) -> list[str]:
     """Retrieve top-3 user preferences from Qdrant closest to the current request."""
     try:
         vec = await embed_text(state.user_request)
-        hits = get_qdrant().query_points(
+        hits = (await get_qdrant().query_points(
             collection_name=_PREFS_COLLECTION,
             query=vec,
             using=DENSE_VECTOR,
             query_filter=Filter(must=[FieldCondition(key="user_id", match=MatchValue(value=state.user_id))]),
             limit=_TOP_PREFS,
-        ).points
+        )).points
         return [h.payload.get("text", "") for h in hits if h.payload]
     except Exception as exc:
         log.warning("preferences_fetch_failed", error=str(exc))

@@ -111,13 +111,13 @@ async def _dense_only_search(
 ) -> list[RetrievedPlan]:
     """Plain cosine search against the dense named vector (hybrid disabled or fallback)."""
     t0 = time.monotonic()
-    hits = get_qdrant().query_points(
+    hits = (await get_qdrant().query_points(
         collection_name=_PLANS_COLLECTION,
         query=vec,
         using=DENSE_VECTOR,
         query_filter=qfilter,
         limit=k,
-    ).points
+    )).points
     plans = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
              for h in hits]
     plans = [p for p in plans if p is not None]
@@ -142,9 +142,9 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     sparse = await embed_sparse(query)
     t1 = time.monotonic()
     client = get_qdrant()
-    # TODO(REVIEW.md R26): the fused and dense passes below run sequentially
-    # because QdrantClient is sync; switch to AsyncQdrantClient and gather them.
-    fused = client.query_points(
+    # TODO(REVIEW.md R27): the fused and dense passes are independent and can be
+    # asyncio.gather'd now that the client is async.
+    fused = (await client.query_points(
         collection_name=_PLANS_COLLECTION,
         prefetch=[
             Prefetch(query=vec, using=DENSE_VECTOR, filter=qfilter, limit=k),
@@ -152,16 +152,16 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
         ],
         query=FusionQuery(fusion=Fusion.RRF),
         limit=k,
-    ).points
+    )).points
     t2 = time.monotonic()
     # RRF drops per-vector scores, so run one dense pass to recover cosine per hit.
-    dense = client.query_points(
+    dense = (await client.query_points(
         collection_name=_PLANS_COLLECTION,
         query=vec,
         using=DENSE_VECTOR,
         query_filter=qfilter,
         limit=k,
-    ).points
+    )).points
     t3 = time.monotonic()
     cosine = {str(getattr(h, "id", "")): float(getattr(h, "score", 0.0)) for h in dense}
     plans: list[RetrievedPlan] = []

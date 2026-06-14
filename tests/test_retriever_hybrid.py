@@ -31,7 +31,7 @@ class _FakeClient:
         self._dense = dense
         self.calls: list[str] = []
 
-    def query_points(self, **kwargs):
+    async def query_points(self, **kwargs):
         if "prefetch" in kwargs:
             self.calls.append("fused")
             return SimpleNamespace(points=self._fused)
