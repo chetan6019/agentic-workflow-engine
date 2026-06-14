@@ -15,7 +15,13 @@ from app.config import get_settings
 from app.core.background import spawn
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
-from app.data.repositories import create_session, get_plan_by_trace_id, save_plan
+from app.data.repositories import (
+    create_session,
+    get_plan_by_trace_id,
+    get_recent_messages,
+    save_message,
+    save_plan,
+)
 from app.orchestration.graph import compile_graph, discard_thread
 
 log = structlog.get_logger(__name__)
@@ -51,6 +57,8 @@ class InvokeResponse(BaseModel):
 
 _PHASE_KEY = "phase:{trace_id}"
 _PHASE_TTL = 600
+# Prior conversation turns fed to the planner for follow-up resolution.
+_HISTORY_TURNS = 6
 
 
 def _phase_label(state: AgentState) -> str:
@@ -109,6 +117,13 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
         await save_plan(final_state)
     except Exception as exc:
         log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
+    # Record the assistant turn so the next request's planner has it as context.
+    if final_state.draft is not None:
+        try:
+            await save_message(initial.session_id, "assistant", final_state.draft.summary)
+        except Exception as exc:
+            log.warning("assistant_message_persist_failed",
+                        trace_id=initial.trace_id, error=str(exc))
     # State is now in Postgres; drop the in-memory checkpoint (resume rebuilds
     # from Postgres, so it's never read again — see discard_thread).
     await discard_thread(initial.trace_id)
@@ -125,16 +140,27 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
     if not user_id:
         raise HTTPException(status_code=401, detail="unauthenticated")
 
-    session_id = req.session_id or await create_session(user_id)
+    session_id = str(req.session_id or await create_session(user_id))
     trace_id = uuid4().hex
     log.info("invoke_accepted", trace_id=trace_id, user_id=user_id,
-             session_id=str(session_id), new_session=req.session_id is None)
+             session_id=session_id, new_session=req.session_id is None)
+
+    # Load prior turns BEFORE saving the current one, so history holds only the
+    # conversation up to (not including) this request. Best-effort: a memory hiccup
+    # must not block the run.
+    try:
+        history = await get_recent_messages(session_id, _HISTORY_TURNS)
+        await save_message(session_id, "user", req.user_request)
+    except Exception as exc:
+        log.warning("history_load_failed", trace_id=trace_id, error=str(exc))
+        history = []
 
     initial = AgentState(
         trace_id=trace_id,
         user_id=user_id,
-        session_id=str(session_id),
+        session_id=session_id,
         user_request=req.user_request,
+        history=history,
         requires_approval=req.require_approval,
     )
     await _set_phase(trace_id, "🚀 starting")

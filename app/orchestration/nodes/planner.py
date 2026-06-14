@@ -80,6 +80,7 @@ async def planner_node(state: AgentState) -> AgentState:
         now_local=now.isoformat(),
         tz_name=tz,
         weekday_ref=_weekday_reference(now),
+        history=state.history,
     )
 
     meta = run_metadata(state)

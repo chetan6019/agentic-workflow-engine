@@ -122,6 +122,10 @@ class AgentState(BaseModel):
     user_id: str = Field(description="Authenticated user ID.")
     session_id: str = Field(description="Chat session ID.")
     user_request: str = Field(description="Original natural-language request.")
+    history: list[dict[str, str]] = Field(
+        default_factory=list,
+        description="Prior conversation turns ({role, content}) for planner context.",
+    )
     retrieved_plans: list[RetrievedPlan] = Field(default_factory=list, description="RAG hits.")
     plan: ExecutionPlan | None = Field(default=None, description="Current execution plan.")
     tool_results: list[ToolResult] = Field(default_factory=list, description="Tool call outcomes.")

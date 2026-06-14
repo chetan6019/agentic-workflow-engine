@@ -11,7 +11,16 @@ from sqlalchemy import select, update
 
 from app.core.state import AgentState, ToolResult
 from app.data.db import get_async_session
-from app.data.models import Approval, Feedback, IntegrationToken, Plan, Session, ToolCall, User
+from app.data.models import (
+    Approval,
+    Feedback,
+    IntegrationToken,
+    Message,
+    Plan,
+    Session,
+    ToolCall,
+    User,
+)
 
 log = structlog.get_logger(__name__)
 
@@ -72,6 +81,23 @@ async def rename_session(session_id: str, user_id: str, title: str) -> bool:
         )
         log.info("session_renamed", session_id=session_id, ok=result.rowcount > 0)
         return result.rowcount > 0
+
+
+async def save_message(session_id: str, role: str, content: str) -> None:
+    """Append one chat message (role: user|assistant) to a session's history."""
+    async with get_async_session() as s:
+        s.add(Message(session_id=session_id, role=role, content=content))
+        log.debug("message_saved", session_id=session_id, role=role)
+
+
+async def get_recent_messages(session_id: str, limit: int) -> list[dict[str, str]]:
+    """Return the last `limit` messages for a session, oldest-first ({role, content})."""
+    async with get_async_session() as s:
+        rows = (await s.execute(
+            select(Message).where(Message.session_id == session_id)
+            .order_by(Message.created_at.desc()).limit(limit)
+        )).scalars().all()
+    return [{"role": r.role, "content": r.content} for r in reversed(rows)]
 
 
 async def save_plan(state: AgentState) -> None:

@@ -25,6 +25,8 @@ offset (e.g. 2026-06-11T09:00:00+05:30). Never emit a bare-UTC "Z" time for a lo
 For any named weekday ("Monday", "coming Monday", "this Friday", "next Tuesday") you MUST
 use the EXACT date listed in <weekday_reference> — never compute the weekday yourself.
 "Coming"/"next"/"this <weekday>" all map to that weekday's date in the reference.
+If <history> is present, use it to resolve references to earlier turns
+("that meeting", "reply to it", "the same people") — but never invent ids from it.
 NEVER invent identifiers you were not explicitly given (event_id, message_id, page_id,
 etc.). A made-up id will fail. To update or delete an EXISTING calendar event the user only
 describes ("the 1:1 with Priya tomorrow"), OMIT event_id entirely and instead pass
@@ -141,14 +143,24 @@ def _slim_examples(examples: list[Any]) -> list[dict[str, Any]]:
     return out
 
 
+def _history_block(history: list[dict[str, str]]) -> str:
+    """Render recent turns so follow-ups ('move that meeting') resolve; empty when none."""
+    if not history:
+        return ""
+    lines = [f"{t.get('role', '?')}: {str(t.get('content', ''))[:200]}" for t in history]
+    return "<history>\n" + "\n".join(lines) + "\n</history>\n\n"
+
+
 def build_planner_messages(user_request: str, examples: list[Any], tool_specs: list[Any],
-                           now_local: str, tz_name: str, weekday_ref: str) -> list[BaseMessage]:
+                           now_local: str, tz_name: str, weekday_ref: str,
+                           history: list[dict[str, str]] | None = None) -> list[BaseMessage]:
     """Build planner prompt with tool listing, retrieved-plan examples, and time context."""
     tools_block = json.dumps(_slim_tool_specs(tool_specs))
     examples_block = json.dumps(_slim_examples(examples))
     context = f"Current time: {now_local}\nTimezone: {tz_name}"
     human = (f"<context>\n{context}\n</context>\n\n"
              f"<weekday_reference>\n{weekday_ref}\n</weekday_reference>\n\n"
+             f"{_history_block(history or [])}"
              f"<examples>\n{examples_block}\n</examples>\n\n"
              f"<tools>\n{tools_block}\n</tools>\n\n"
              f"<request>\n{user_request}\n</request>")
