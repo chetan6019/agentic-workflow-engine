@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -74,22 +75,50 @@ async def rename_session(session_id: str, user_id: str, title: str) -> bool:
         return result.rowcount > 0
 
 
+# Long tool outputs (e.g. full Gmail message bodies) bloat the forever-persisted
+# plans row; clip any string past this length in the snapshot (REVIEW.md R36). The
+# in-memory state keeps the full values — only the persisted copy is trimmed.
+_PERSIST_STR_LIMIT = 2000
+
+
+def _clip(value: Any) -> Any:
+    """Recursively clip over-long strings inside a tool output payload."""
+    if isinstance(value, str):
+        return value[:_PERSIST_STR_LIMIT] + "…[truncated]" if len(value) > _PERSIST_STR_LIMIT else value
+    if isinstance(value, dict):
+        return {k: _clip(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_clip(v) for v in value]
+    return value
+
+
+def _persistable_json(state: AgentState) -> str:
+    """Serialize state for the plans row with long tool outputs trimmed."""
+    data = state.model_dump()
+    for r in data.get("tool_results", []):
+        if isinstance(r.get("output"), dict):
+            r["output"] = _clip(r["output"])
+    return json.dumps(data, default=str)
+
+
 async def save_plan(state: AgentState) -> None:
-    """Upsert an AgentState snapshot into the plans table."""
+    """Upsert an AgentState snapshot into the plans table (tool outputs clipped)."""
+    payload = _persistable_json(state)
     async with get_async_session() as s:
         existing = (await s.execute(select(Plan).where(Plan.trace_id == state.trace_id))).scalar_one_or_none()
         if existing:
-            existing.state_json = state.model_dump_json()
+            existing.state_json = payload
         else:
-            s.add(Plan(trace_id=state.trace_id, user_id=state.user_id, state_json=state.model_dump_json()))
+            s.add(Plan(trace_id=state.trace_id, user_id=state.user_id, state_json=payload))
         log.info("plan_saved", trace_id=state.trace_id)
 
 
 async def get_plan_by_trace_id(trace_id: str) -> dict[str, Any] | None:
-    """Fetch the persisted AgentState snapshot for a trace."""
+    """Fetch the persisted AgentState snapshot for a trace (with its owner user_id)."""
     async with get_async_session() as s:
         row = (await s.execute(select(Plan).where(Plan.trace_id == trace_id))).scalar_one_or_none()
-        return {"trace_id": row.trace_id, "state_json": row.state_json} if row else None
+        return {"trace_id": row.trace_id, "user_id": row.user_id,
+                "state_json": row.state_json} if row else None
 
 
 async def save_tool_call(trace_id: str, result: ToolResult) -> None:

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone
 from typing import Literal
 
@@ -11,7 +10,6 @@ from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.state import AgentState, DraftResponse
-from app.data.redis_client import get_redis
 from app.data.repositories import (
     get_approval_by_token,
     get_plan_by_trace_id,
@@ -22,8 +20,6 @@ from app.orchestration.graph import compile_graph
 
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
-
-_SSE_CHANNEL = "sse:{trace_id}"
 
 
 class ApprovalRequest(BaseModel):
@@ -80,13 +76,6 @@ def _is_expired(expires_at) -> bool:
     return expires_at < datetime.now(timezone.utc)
 
 
-async def _publish_resume(trace_id: str, state: AgentState) -> None:
-    """Publish the resumed state to the SSE channel for the trace."""
-    redis = get_redis()
-    await redis.publish(_SSE_CHANNEL.format(trace_id=trace_id), state.model_dump_json())
-    await redis.publish(_SSE_CHANNEL.format(trace_id=trace_id), json.dumps({"done": True}))
-
-
 @router.post("/approvals/{token}", response_model=ApprovalResponse)
 async def submit_approval(token: str, req: ApprovalRequest) -> ApprovalResponse:
     """Apply the user's decision to the paused workflow and resume the graph."""
@@ -133,7 +122,6 @@ async def submit_approval(token: str, req: ApprovalRequest) -> ApprovalResponse:
 
     await save_plan(final_state)
     await update_approval_status(token, req.decision)
-    await _publish_resume(state.trace_id, final_state)
     log.info("approval_resumed", trace_id=state.trace_id,
              confidence=round(final_state.confidence, 3), error=final_state.error)
     return ApprovalResponse(status="resumed")

@@ -45,7 +45,7 @@ def _approval(hours: float = 1.0) -> dict:
 def wired(monkeypatch):
     """Wire submit_approval's collaborators to fakes; returns the recorder."""
     calls = SimpleNamespace(approval=_approval(), state=_state(),
-                            saved=[], updated=[], invoked=[], published=[])
+                            saved=[], updated=[], invoked=[])
 
     async def fake_get_approval(token):
         return calls.approval
@@ -59,9 +59,6 @@ def wired(monkeypatch):
     async def fake_update(token, decision):
         calls.updated.append((token, decision))
 
-    async def fake_publish(trace_id, state):
-        calls.published.append(trace_id)
-
     class _FakeCompiled:
         async def ainvoke(self, state, config=None):
             calls.invoked.append(state)
@@ -71,7 +68,6 @@ def wired(monkeypatch):
     monkeypatch.setattr(approvals, "get_plan_by_trace_id", fake_get_plan)
     monkeypatch.setattr(approvals, "save_plan", fake_save_plan)
     monkeypatch.setattr(approvals, "update_approval_status", fake_update)
-    monkeypatch.setattr(approvals, "_publish_resume", fake_publish)
     monkeypatch.setattr(approvals, "compile_graph", lambda: _FakeCompiled())
     return calls
 
@@ -132,7 +128,6 @@ async def test_edit_replaces_draft_and_resumes(wired):
     assert resumed.draft is not None and resumed.draft.summary == "edited"
     assert resumed.requires_approval is False
     assert wired.updated == [("tok", "edit")]
-    assert wired.published == ["t"]
 
 
 async def test_approve_rebooks_calendar_conflict(wired):

@@ -31,13 +31,8 @@ async def _jwt_middleware(request: Request, call_next) -> Response:
     public = {"/healthz", "/readyz", "/v1/auth/register", "/v1/auth/login"}
     if request.url.path not in public and not request.url.path.startswith("/v1/approvals"):
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            try:
-                request.state.user_id = decode_access_token(auth_header.removeprefix("Bearer "))
-            except Exception:
-                pass
-        else:
-            request.state.user_id = None
+        token = auth_header.removeprefix("Bearer ") if auth_header.startswith("Bearer ") else ""
+        request.state.user_id = decode_access_token(token) if token else None
     return await call_next(request)
 
 

@@ -1,4 +1,4 @@
-"""POST /v1/invoke and GET /v1/invoke/stream/{trace_id}."""
+"""POST /v1/invoke plus the phase/result polling endpoints the UI reads."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.state import AgentState
@@ -19,8 +18,6 @@ from app.orchestration.graph import compile_graph
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
 
-_SSE_CHANNEL = "sse:{trace_id}"
-_DONE = json.dumps({"done": True})
 # Hold strong refs to background runs so they aren't garbage-collected mid-await
 # (asyncio only weakly references tasks; a dropped ref can cancel the run).
 _BG_TASKS: set[asyncio.Task] = set()
@@ -62,7 +59,7 @@ def _phase_label(state: AgentState) -> str:
         return "❌ failed"
     if state.requires_approval:
         return "🛑 awaiting approval"
-    if state.draft and state.confidence > 0:
+    if state.draft and state.verdict is not None:
         return "💾 finalizing"
     if state.draft:
         return "🛡️ checking quality"
@@ -75,63 +72,32 @@ def _phase_label(state: AgentState) -> str:
     return "📥 retrieving context"
 
 
-async def _set_phase(trace_id: str, label: str, *, done: bool = False) -> None:
-    """Write the current phase to Redis so the UI can poll it."""
-    payload = json.dumps({"phase": label, "done": done})
+async def _set_phase(trace_id: str, label: str, owner: str,
+                     *, done: bool = False) -> None:
+    """Write the current phase (+ owner) to Redis so the UI can poll it.
+
+    ``owner`` lets the poll endpoint enforce ownership without a DB round-trip on
+    every tick — the run's user_id travels with the phase key (REVIEW.md R15).
+    """
+    payload = json.dumps({"phase": label, "done": done, "owner": owner})
     await get_redis().set(_PHASE_KEY.format(trace_id=trace_id), payload, ex=_PHASE_TTL)
-
-
-async def _publish(trace_id: str, payload: str) -> None:
-    """Publish one SSE frame to the trace's Redis pubsub channel."""
-    redis = get_redis()
-    await redis.publish(_SSE_CHANNEL.format(trace_id=trace_id), payload)
-
-
-async def _run_and_publish(initial: AgentState) -> None:
-    """Stream graph state updates to Redis pubsub and persist the final state."""
-    compiled = compile_graph()
-    config = {"configurable": {"thread_id": initial.trace_id}}
-    frames = 0
-    final_state = initial
-    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
-    try:
-        async for chunk in compiled.astream(initial, config=config, stream_mode="values"):
-            try:
-                final_state = AgentState.model_validate(chunk)
-                payload = final_state.model_dump_json()
-            except Exception:
-                payload = json.dumps({"partial": True})
-            await _publish(initial.trace_id, payload)
-            frames += 1
-    except Exception as exc:
-        log.exception("workflow_run_failed", trace_id=initial.trace_id, error=str(exc))
-        final_state.error = final_state.error or str(exc)
-        await _publish(initial.trace_id, json.dumps({"error": str(exc)}))
-    finally:
-        # Persist the final state so the UI can fetch the result even if SSE
-        # frames were missed (idempotent with the finalize-phase save_plan).
-        try:
-            await save_plan(final_state)
-        except Exception as exc:
-            log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
-        log.info("workflow_run_done", trace_id=initial.trace_id, frames=frames)
-        await _publish(initial.trace_id, _DONE)
 
 
 async def _run_workflow_with_phase(initial: AgentState) -> None:
     """Run the graph in the background, updating Redis phase + persisting the state."""
     compiled = compile_graph()
     config = {"configurable": {"thread_id": initial.trace_id}}
-    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
+    owner = initial.user_id
+    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=owner)
     final_state = initial
-    await _set_phase(initial.trace_id, "📥 retrieving context")
+    await _set_phase(initial.trace_id, "📥 retrieving context", owner)
     try:
         async for chunk in compiled.astream(initial, config=config, stream_mode="values"):
             try:
                 final_state = AgentState.model_validate(chunk)
             except Exception:
                 continue
-            await _set_phase(initial.trace_id, _phase_label(final_state))
+            await _set_phase(initial.trace_id, _phase_label(final_state), owner)
     except Exception as exc:
         log.exception("workflow_run_failed", trace_id=initial.trace_id, error=str(exc))
         final_state.error = final_state.error or str(exc)
@@ -139,7 +105,7 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
         await save_plan(final_state)
     except Exception as exc:
         log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
-    await _set_phase(initial.trace_id, _phase_label(final_state), done=True)
+    await _set_phase(initial.trace_id, _phase_label(final_state), owner, done=True)
     log.info("workflow_run_done", trace_id=initial.trace_id,
              has_draft=final_state.draft is not None, error=final_state.error)
 
@@ -163,65 +129,51 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
         user_request=req.user_request,
         requires_approval=req.require_approval,
     )
-    await _set_phase(trace_id, "🚀 starting")
+    await _set_phase(trace_id, "🚀 starting", user_id)
     _spawn(_run_workflow_with_phase(initial))
     return InvokeResponse(trace_id=trace_id)
 
 
+def _require_user(request: Request) -> str:
+    """Return the authenticated user_id or raise 401 (JWT middleware sets it)."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    return user_id
+
+
 @router.get("/invoke/phase/{trace_id}")
-async def invoke_phase(trace_id: str) -> dict:
+async def invoke_phase(trace_id: str, request: Request) -> dict:
     """Return the current workflow phase for live progress, polled by the UI."""
+    user_id = _require_user(request)
     raw = await get_redis().get(_PHASE_KEY.format(trace_id=trace_id))
     if not raw:
         return {"phase": "pending", "done": False}
-    return json.loads(raw)
-
-
-async def _sse_stream(trace_id: str):
-    """Yield SSE frames from the trace's Redis pubsub channel until done."""
-    redis = get_redis()
-    pubsub = redis.pubsub()
-    channel = _SSE_CHANNEL.format(trace_id=trace_id)
-    await pubsub.subscribe(channel)
-    log.info("sse_subscribed", trace_id=trace_id)
-    try:
-        async for msg in pubsub.listen():
-            if msg is None or msg.get("type") != "message":
-                continue
-            data = msg.get("data")
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-            yield f"data: {data}\n\n"
-            if data == _DONE:
-                break
-    except asyncio.CancelledError:
-        log.info("sse_client_disconnected", trace_id=trace_id)
-    finally:
-        await pubsub.unsubscribe(channel)
-        await pubsub.aclose()
-        log.debug("sse_unsubscribed", trace_id=trace_id)
-
-
-@router.get("/invoke/stream/{trace_id}")
-async def invoke_stream(trace_id: str) -> StreamingResponse:
-    """Server-Sent Events stream of state updates for a trace."""
-    return StreamingResponse(_sse_stream(trace_id), media_type="text/event-stream")
+    data = json.loads(raw)
+    # Ownership: the run's user_id rides with the phase key, so a caller can only
+    # see progress for their own runs (REVIEW.md R15). No DB hit on the poll path.
+    if data.get("owner") and data["owner"] != user_id:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {"phase": data.get("phase", "pending"), "done": data.get("done", False)}
 
 
 @router.get("/invoke/result/{trace_id}")
-async def invoke_result(trace_id: str) -> dict:
+async def invoke_result(trace_id: str, request: Request) -> dict:
     """Authoritative final state for a trace, read from the persisted plan.
 
-    The UI fetches this after the SSE stream so the answer survives missed frames.
-    The plan row is written mid-run (before the draft exists, to satisfy the
-    tool_calls FK), so we mark it 'done' once any reliable terminal signal is
-    present: an error, a populated draft, or a non-zero confidence (which only
-    gets set after guardrails runs, i.e. after the graph fully completes).
+    Requires a valid JWT and ownership of the run (REVIEW.md R15) — the final state
+    can contain emails and calendar contents. The plan row is written mid-run (before
+    the draft exists, to satisfy the tool_calls FK), so we mark it 'done' once a
+    reliable terminal signal is present: an error, a populated draft, or a guardrails
+    verdict (set only after the graph completes scoring).
     """
+    user_id = _require_user(request)
     row = await get_plan_by_trace_id(trace_id)
     if not row:
         return {"status": "pending"}
+    if row.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="not_found")
     state = json.loads(row["state_json"])
     draft_md = (state.get("draft") or {}).get("detail_markdown")
-    done = bool(draft_md) or bool(state.get("error")) or float(state.get("confidence") or 0) > 0
+    done = bool(draft_md) or bool(state.get("error")) or state.get("verdict") is not None
     return {"status": "done" if done else "pending", "state": state}
