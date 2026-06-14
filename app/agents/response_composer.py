@@ -10,16 +10,16 @@ from pydantic import ValidationError
 from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 from app.config import get_settings
-from app.core.state import AgentState, DraftResponse, ToolSpec
+from app.core.state import AgentState, DraftResponse
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_composer_messages, build_direct_answer_messages
 from app.rag.embedder import embed_text
 from app.rag.qdrant_client import DENSE_VECTOR, get_qdrant
+from app.rag.tool_docs import fetch_tool_specs
 
 log = structlog.get_logger(__name__)
 _PREFS_COLLECTION = "preferences"
 _TOP_PREFS = 3
-_TOOL_DOC_COLLECTION = "tool_capability_docs"
 _TOOL_DOC_K = 12
 # Schema/JSON failures = LLM responded but the body was malformed → deterministic
 # fallback is safe. Anything else (rate limits, timeouts, API errors, network)
@@ -77,34 +77,10 @@ def _inject_failures(draft: DraftResponse, state: AgentState) -> DraftResponse:
     return draft.model_copy(update={"actions_pending": pending})
 
 
-async def _fetch_tool_catalog(user_request: str) -> list[ToolSpec]:
-    """Vector-search Qdrant tool_capability_docs for the top tool specs.
-
-    Mirrors the planner's helper so the direct-answer path knows the same
-    capability surface as the planner would have considered.
-    """
-    try:
-        vec = await embed_text(user_request)
-        hits = get_qdrant().query_points(
-            collection_name=_TOOL_DOC_COLLECTION, query=vec, using=DENSE_VECTOR, limit=_TOOL_DOC_K
-        ).points
-    except Exception as exc:
-        log.warning("direct_answer_tool_catalog_failed", error=str(exc))
-        return []
-    specs: list[ToolSpec] = []
-    for hit in hits:
-        payload = getattr(hit, "payload", None) or {}
-        try:
-            specs.append(ToolSpec.model_validate(payload))
-        except Exception:
-            continue
-    return specs
-
-
 async def _compose_direct_answer(state: AgentState, preferences: list[str],
                                  judge_feedback: str | None = None) -> DraftResponse:
     """Answer a meta/conversational request directly when no tools were involved."""
-    tool_specs = await _fetch_tool_catalog(state.user_request)
+    tool_specs = await fetch_tool_specs(state.user_request, _TOOL_DOC_K)
     messages = build_direct_answer_messages(
         user_request=state.user_request,
         tool_specs=tool_specs,
