@@ -41,11 +41,13 @@ def _apply_metadata(llm: ChatOpenAI, role: str, metadata: dict[str, str]) -> Cha
     The metadata keys are LiteLLM's Langfuse grouping fields (trace_id,
     session_id, trace_user_id, generation_name), so every LLM hop of one
     workflow run lands in a single Langfuse trace with generations named by
-    role. The body-level `user` additionally feeds LiteLLM's per-end-user
-    spend tracking. model_copy is shallow: the underlying HTTP client and its
-    connection pool stay shared with the cached instance.
+    role. For cost attribution: body-level `user` drives LiteLLM's per-end-user
+    spend, and `metadata.tags = ["role:<role>"]` drives its per-tag spend
+    (/spend/tags), so planner vs. judge cost separates without per-role keys.
+    model_copy is shallow: the underlying HTTP client and its connection pool
+    stay shared with the cached instance.
     """
-    md: dict[str, str] = {"generation_name": role, **metadata}
+    md: dict[str, Any] = {"generation_name": role, "tags": [f"role:{role}"], **metadata}
     user_id = md.pop("user_id", None)
     if user_id:
         md["trace_user_id"] = user_id
