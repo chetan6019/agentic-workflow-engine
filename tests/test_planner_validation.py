@@ -1,0 +1,111 @@
+"""Planner plan-validation tests (REVIEW.md R32).
+
+planner_node is driven with fetch_tool_specs, _invoke_planner, and get_settings
+faked, so the validate → correct-once → fail-honestly path runs with no LLM,
+Qdrant, or settings file.
+"""
+
+from __future__ import annotations
+
+from types import SimpleNamespace
+
+import pytest
+
+from app.core.state import AgentState, ExecutionPlan, PlanStep, ToolSpec
+from app.orchestration.nodes import planner
+
+
+def _spec(name: str, server: str) -> ToolSpec:
+    return ToolSpec(name=name, description="d", server=server)
+
+
+def _plan(tool: str, action: str) -> ExecutionPlan:
+    return ExecutionPlan(
+        reasoning="r", steps=[PlanStep(id="s1", tool=tool, action=action)],
+        strategy="sequential", complexity_score=1, estimated_cost_usd=0.0,
+        requires_approval=False)
+
+
+def _state() -> AgentState:
+    return AgentState(trace_id="t", user_id="u", session_id="s",
+                      user_request="send an email")
+
+
+@pytest.fixture
+def wire(monkeypatch):
+    """Fake settings + tool catalog; returns a configure(specs, plans) helper."""
+    monkeypatch.setattr(planner, "get_settings",
+                        lambda: SimpleNamespace(default_tz="Asia/Kolkata"))
+
+    def configure(specs, plans):
+        async def fake_specs(_query, _k):
+            return specs
+
+        invoked = []
+
+        async def fake_invoke(_role, messages, _meta):
+            invoked.append(messages)
+            return plans.pop(0)
+
+        monkeypatch.setattr(planner, "fetch_tool_specs", fake_specs)
+        monkeypatch.setattr(planner, "_invoke_planner", fake_invoke)
+        return invoked
+
+    return configure
+
+
+# ── _invalid_steps (pure) ────────────────────────────────────────────────────
+
+
+def test_invalid_steps_accepts_known_pair():
+    assert planner._invalid_steps(_plan("gmail", "send_email"),
+                                  [_spec("send_email", "gmail")]) == []
+
+
+def test_invalid_steps_accepts_swapped_pair():
+    # MCP client resolves swapped server/action, so validation tolerates it.
+    assert planner._invalid_steps(_plan("send_email", "gmail"),
+                                  [_spec("send_email", "gmail")]) == []
+
+
+def test_invalid_steps_flags_unknown_action():
+    bad = planner._invalid_steps(_plan("gmail", "teleport"), [_spec("send_email", "gmail")])
+    assert bad == ["s1:gmail/teleport"]
+
+
+# ── planner_node ─────────────────────────────────────────────────────────────
+
+
+async def test_valid_plan_passes_without_correction(wire):
+    invoked = wire([_spec("send_email", "gmail")], [_plan("gmail", "send_email")])
+    state = await planner.planner_node(_state())
+    assert state.error is None
+    assert state.plan is not None
+    assert len(invoked) == 1  # no corrective re-plan
+
+
+async def test_invalid_plan_is_corrected_on_retry(wire):
+    invoked = wire([_spec("send_email", "gmail")],
+                   [_plan("gmail", "bogus"), _plan("gmail", "send_email")])
+    state = await planner.planner_node(_state())
+    assert state.error is None
+    assert state.plan.steps[0].action == "send_email"
+    assert len(invoked) == 2
+    assert "<correction>" in invoked[1][-1].content  # feedback appended
+
+
+async def test_still_invalid_after_retry_sets_error(wire):
+    wire([_spec("send_email", "gmail")],
+         [_plan("gmail", "bogus"), _plan("gmail", "stillbogus")])
+    state = await planner.planner_node(_state())
+    assert state.error is not None
+    assert state.error.startswith("plan_validation_failed")
+    assert state.plan is None
+
+
+async def test_empty_catalog_skips_validation(wire):
+    invoked = wire([], [_plan("gmail", "anything")])
+    state = await planner.planner_node(_state())
+    assert state.error is None
+    assert state.plan is not None
+    assert len(invoked) == 1  # no validation attempted

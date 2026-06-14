@@ -9,10 +9,11 @@ from zoneinfo import ZoneInfo
 
 import structlog
 from langchain_core.exceptions import OutputParserException
+from langchain_core.messages import HumanMessage
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.core.state import AgentState, ExecutionPlan
+from app.core.state import AgentState, ExecutionPlan, ToolSpec
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_planner_messages
 from app.rag.tool_docs import fetch_tool_specs
@@ -49,6 +50,20 @@ async def _invoke_planner(role: str, messages: list[Any],
     return await llm.ainvoke(messages)
 
 
+def _invalid_steps(plan: ExecutionPlan, tool_specs: list[ToolSpec]) -> list[str]:
+    """Return descriptions of steps whose tool/action aren't in the catalog.
+
+    The planner contract is tool=server, action=tool-name; the swapped form is
+    accepted too because the MCP client resolves it. Empty list = every step
+    maps to a known tool, so we catch hallucinated names here — before any tool
+    runs — instead of as a runtime unknown_tool failure mid-execution.
+    """
+    valid = {(s.server, s.name) for s in tool_specs}
+    return [f"{step.id}:{step.tool}/{step.action}" for step in plan.steps
+            if (step.tool, step.action) not in valid
+            and (step.action, step.tool) not in valid]
+
+
 async def planner_node(state: AgentState) -> AgentState:
     """Build an ExecutionPlan from the user request, retrieved plans, and tool specs."""
     log.info("planner_node_start", retry_count=state.retry_count,
@@ -80,6 +95,26 @@ async def planner_node(state: AgentState) -> AgentState:
         log.error("planner_failed", error=str(exc))
         state.error = f"planner_failed: {exc!s}"
         return state
+
+    # Validate the plan against the known tools before anything executes. Skip when
+    # the catalog is empty (unreachable) — don't fail a run on an infra hiccup.
+    if tool_specs and (bad := _invalid_steps(plan, tool_specs)):
+        log.warning("planner_plan_invalid", steps=bad)
+        correction = HumanMessage(content=(
+            "<correction>\nThe previous plan referenced tools/actions not in "
+            f"<tools>: {'; '.join(bad)}. Re-output the FULL plan using ONLY the "
+            "listed tools, with `tool` = the server and `action` = the tool name."
+            "\n</correction>"))
+        try:
+            plan = await _invoke_planner("planner-default", [*messages, correction], meta)
+        except Exception as exc:
+            log.error("planner_revalidation_failed", error=str(exc))
+            state.error = f"plan_validation_failed: {exc!s}"
+            return state
+        if still_bad := _invalid_steps(plan, tool_specs):
+            log.error("planner_plan_still_invalid", steps=still_bad)
+            state.error = f"plan_validation_failed:{','.join(still_bad)}"
+            return state
 
     state.plan = plan
     log.info("planner_node_done", steps=len(plan.steps), strategy=plan.strategy,
