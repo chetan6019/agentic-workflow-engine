@@ -38,16 +38,14 @@ log = structlog.get_logger(__name__)
 
 Provider = Literal["openai", "hf"]
 _CACHE_TTL = 86_400
-_HF_MODEL_DEFAULT = "BAAI/bge-base-en-v1.5"
 # BM25 lexical model. Pure CPU, no network at query time after the one-off model
 # download, and not an LLM embedding — keeps the LiteLLM-only rule intact.
 _BM25_MODEL = "Qdrant/bm25"
 
 
 def _resolved_provider() -> Provider:
-    """Return the configured provider, defaulting to ``openai``."""
-    raw = getattr(get_settings(), "embedding_provider", "openai").lower()
-    return "hf" if raw == "hf" else "openai"
+    """Return the configured embedding provider (declared in Settings)."""
+    return get_settings().embedding_provider
 
 
 def _build_embeddings(provider: Provider) -> Embeddings:
@@ -64,7 +62,7 @@ def _build_embeddings(provider: Provider) -> Embeddings:
                 "and needs neither."
             ) from exc
         return HuggingFaceEmbeddings(
-            model_name=getattr(s, "hf_embedding_model", _HF_MODEL_DEFAULT),
+            model_name=s.hf_embedding_model,
             encode_kwargs={"normalize_embeddings": True},
         )
     return OpenAIEmbeddings(
