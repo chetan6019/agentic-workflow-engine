@@ -48,3 +48,6 @@ dev = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+# Put the repo root on sys.path so `import app` works under the bare `pytest`
+# console script in CI (which, unlike `python -m pytest`, does not add cwd).
+pythonpath = ["."]
