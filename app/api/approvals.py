@@ -16,7 +16,7 @@ from app.data.repositories import (
     save_plan,
     update_approval_status,
 )
-from app.orchestration.graph import compile_graph
+from app.orchestration.graph import compile_graph, discard_thread
 
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
@@ -122,6 +122,7 @@ async def submit_approval(token: str, req: ApprovalRequest) -> ApprovalResponse:
 
     await save_plan(final_state)
     await update_approval_status(token, req.decision)
+    await discard_thread(state.trace_id)  # state persisted; checkpoint no longer needed
     log.info("approval_resumed", trace_id=state.trace_id,
              confidence=round(final_state.confidence, 3), error=final_state.error)
     return ApprovalResponse(status="resumed")

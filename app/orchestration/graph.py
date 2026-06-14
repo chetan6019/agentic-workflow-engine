@@ -95,3 +95,18 @@ def compile_graph():
     """Return the compiled LangGraph singleton with an in-memory checkpointer."""
     log.info("graph_compiled")
     return _build_graph().compile(checkpointer=MemorySaver())
+
+
+async def discard_thread(trace_id: str) -> None:
+    """Drop a run's in-memory checkpoints once its graph invocation has returned.
+
+    HITL resume rebuilds state from Postgres rather than the checkpoint (this build
+    routes to END and re-invokes instead of using LangGraph interrupt()), so a
+    thread's checkpoints are pure memory growth once the invocation completes.
+    Best-effort: a failure here must never fail the run.
+    """
+    try:
+        await compile_graph().checkpointer.adelete_thread(trace_id)
+        log.debug("checkpoint_discarded", trace_id=trace_id)
+    except Exception as exc:
+        log.warning("checkpoint_discard_failed", trace_id=trace_id, error=str(exc))

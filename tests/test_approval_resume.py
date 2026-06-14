@@ -59,6 +59,9 @@ def wired(monkeypatch):
     async def fake_update(token, decision):
         calls.updated.append((token, decision))
 
+    async def fake_discard(trace_id):
+        calls.discarded = trace_id
+
     class _FakeCompiled:
         async def ainvoke(self, state, config=None):
             calls.invoked.append(state)
@@ -68,6 +71,7 @@ def wired(monkeypatch):
     monkeypatch.setattr(approvals, "get_plan_by_trace_id", fake_get_plan)
     monkeypatch.setattr(approvals, "save_plan", fake_save_plan)
     monkeypatch.setattr(approvals, "update_approval_status", fake_update)
+    monkeypatch.setattr(approvals, "discard_thread", fake_discard)
     monkeypatch.setattr(approvals, "compile_graph", lambda: _FakeCompiled())
     return calls
 

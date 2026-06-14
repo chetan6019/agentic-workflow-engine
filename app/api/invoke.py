@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
 from app.data.repositories import create_session, get_plan_by_trace_id, save_plan
-from app.orchestration.graph import compile_graph
+from app.orchestration.graph import compile_graph, discard_thread
 
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
@@ -101,6 +101,9 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
         await save_plan(final_state)
     except Exception as exc:
         log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
+    # State is now in Postgres; drop the in-memory checkpoint (resume rebuilds
+    # from Postgres, so it's never read again — see discard_thread).
+    await discard_thread(initial.trace_id)
     await _set_phase(initial.trace_id, _phase_label(final_state), done=True)
     log.info("workflow_run_done", trace_id=initial.trace_id,
              duration_ms=int((time.monotonic() - started) * 1000),
