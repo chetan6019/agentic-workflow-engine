@@ -10,6 +10,7 @@ import structlog
 from langchain_core.exceptions import OutputParserException
 from pydantic import ValidationError
 
+from app.agents.response_composer import compose
 from app.core.state import AgentState, DraftResponse, GuardVerdict
 from app.data.repositories import create_approval, get_token, save_plan
 from app.llm.client import get_structured_llm, run_metadata
@@ -27,6 +28,9 @@ _LOW_CONFIDENCE = 0.55
 # gates instead — calendar clashes and destructive deletes, both handled in the
 # orchestrator. Low confidence (<0.55) still re-plans/blocks via the graph router.
 _HITL_ENABLED = False
+# Above this judge-reported risk the draft is treated as possibly unsupported by
+# the tool evidence and gets one corrective re-composition (see _mitigate_*).
+_HALLUCINATION_RISK_LIMIT = 0.7
 # Only fall back to a neutral verdict when the LLM responded with malformed
 # output — transport errors (rate limit, timeout, API error) propagate so the
 # run fails honestly instead of finalizing with a 0.5-judge confidence.
@@ -99,6 +103,61 @@ def _compute_confidence(state: AgentState, verdict: GuardVerdict) -> float:
     return 0.8 * tool_success_rate + 0.1 * llm_judge_avg + 0.1 * schema_ok
 
 
+async def _judge(state: AgentState) -> GuardVerdict:
+    """Run the guard-judge LLM over the draft + tool-result evidence.
+
+    Malformed judge JSON falls back to a neutral verdict so scoring proceeds from
+    the deterministic signals; transport errors are NOT caught here and propagate.
+    """
+    messages = build_guard_judge_messages(
+        draft=state.draft, user_request=state.user_request, tool_results=state.tool_results)
+    llm = get_structured_llm("guard-judge", GuardVerdict, run_metadata(state))
+    try:
+        return await llm.ainvoke(messages)
+    except _SCHEMA_ERRORS as exc:
+        log.warning("guard_judge_fallback_neutral", error=str(exc))
+        return GuardVerdict(tone_fit=0.5, hallucination_risk=0.5, instruction_adherence=0.5)
+
+
+async def _mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> GuardVerdict:
+    """Re-compose once against the evidence, then re-judge; warn if still risky.
+
+    The tools have already executed, so re-planning would re-fire side effects.
+    Instead the composer gets a single corrective pass constrained to the tool
+    results, and the draft is re-judged. If it still reads as unsupported it
+    ships with a visible warning and a ``degraded`` flag rather than silently.
+    Returns the verdict that should drive the final confidence score.
+    """
+    log.warning("guard_hallucination_flagged", trace_id=state.trace_id,
+                hallucination_risk=round(verdict.hallucination_risk, 3))
+    feedback = (
+        f"A previous draft was flagged for possible unsupported claims "
+        f"(hallucination_risk={verdict.hallucination_risk:.2f}). Rewrite the response "
+        f"using ONLY facts present in the tool results; remove or qualify any "
+        f"statement not directly supported by them."
+    )
+    try:
+        state.draft = await compose(state, judge_feedback=feedback)
+    except Exception as exc:  # transport/compose failure — keep the original draft
+        log.warning("guard_recompose_failed", trace_id=state.trace_id, error=str(exc))
+        state.degraded.append("hallucination_recompose_failed")
+        return verdict
+
+    new_verdict = await _judge(state)
+    if new_verdict.hallucination_risk > _HALLUCINATION_RISK_LIMIT and state.draft is not None:
+        state.draft.detail_markdown = (
+            "> ⚠️ **Heads-up:** parts of this response may not be fully supported by "
+            "the data retrieved. Please verify before acting.\n\n"
+        ) + state.draft.detail_markdown
+        state.degraded.append("unverified_hallucination_risk")
+        log.warning("guard_hallucination_unresolved", trace_id=state.trace_id,
+                    hallucination_risk=round(new_verdict.hallucination_risk, 3))
+    else:
+        log.info("guard_hallucination_mitigated", trace_id=state.trace_id,
+                 hallucination_risk=round(new_verdict.hallucination_risk, 3))
+    return new_verdict
+
+
 async def guardrails_node(state: AgentState) -> AgentState:
     """Score the draft, set confidence + requires_approval, and return updated state."""
     log.info("guardrails_node_start", trace_id=state.trace_id)
@@ -107,16 +166,12 @@ async def guardrails_node(state: AgentState) -> AgentState:
         log.info("guardrails_node_short_circuit", error=state.error)
         return state
 
-    messages = build_guard_judge_messages(draft=state.draft, user_request=state.user_request)
-    llm = get_structured_llm("guard-judge", GuardVerdict, run_metadata(state))
-    try:
-        verdict: GuardVerdict = await llm.ainvoke(messages)
-    except _SCHEMA_ERRORS as exc:
-        # Malformed judge JSON → score from deterministic signals with a neutral
-        # judge component. Transport errors are NOT caught here; they propagate.
-        log.warning("guard_judge_fallback_neutral", error=str(exc))
-        verdict = GuardVerdict(tone_fit=0.5, hallucination_risk=0.5,
-                               instruction_adherence=0.5)
+    verdict = await _judge(state)
+    # Teeth: a high hallucination_risk triggers one corrective re-composition
+    # against the evidence (never a re-plan — tools already ran). The final
+    # verdict (re-judged when mitigated) is what feeds the confidence score.
+    if verdict.hallucination_risk > _HALLUCINATION_RISK_LIMIT:
+        verdict = await _mitigate_hallucination(state, verdict)
 
     state.confidence = _compute_confidence(state, verdict)
     # Medium-confidence band pauses for HITL. Mint the approval token now so the sync

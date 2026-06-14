@@ -101,13 +101,15 @@ async def _fetch_tool_catalog(user_request: str) -> list[ToolSpec]:
     return specs
 
 
-async def _compose_direct_answer(state: AgentState, preferences: list[str]) -> DraftResponse:
+async def _compose_direct_answer(state: AgentState, preferences: list[str],
+                                 judge_feedback: str | None = None) -> DraftResponse:
     """Answer a meta/conversational request directly when no tools were involved."""
     tool_specs = await _fetch_tool_catalog(state.user_request)
     messages = build_direct_answer_messages(
         user_request=state.user_request,
         tool_specs=tool_specs,
         preferences=preferences,
+        judge_feedback=judge_feedback,
     )
     llm = get_structured_llm("composer", DraftResponse, run_metadata(state))
     try:
@@ -130,7 +132,7 @@ async def _compose_direct_answer(state: AgentState, preferences: list[str]) -> D
     return draft
 
 
-async def compose(state: AgentState) -> DraftResponse:
+async def compose(state: AgentState, judge_feedback: str | None = None) -> DraftResponse:
     """Build a DraftResponse from the current AgentState.
 
     For meta/conversational queries (no plan steps, no tool results) the
@@ -138,13 +140,16 @@ async def compose(state: AgentState) -> DraftResponse:
     its grounding. Otherwise it summarises tool results. LLM transport errors
     propagate so the orchestrator can mark the run as failed; only
     schema-validation failures fall back to a deterministic draft.
+
+    ``judge_feedback`` (set on a guard re-composition) is injected as a revision
+    note instructing the model to ground every claim in the tool results.
     """
     structlog.contextvars.bind_contextvars(trace_id=state.trace_id, user_id=state.user_id)
     preferences = await _fetch_preferences(state)
 
     no_steps = state.plan is None or not state.plan.steps
     if no_steps and not state.tool_results:
-        return await _compose_direct_answer(state, preferences)
+        return await _compose_direct_answer(state, preferences, judge_feedback)
 
     messages = build_composer_messages(
         plan=state.plan,
@@ -152,6 +157,7 @@ async def compose(state: AgentState) -> DraftResponse:
         preferences=preferences,
         user_request=state.user_request,
         tz_name=get_settings().default_tz,
+        judge_feedback=judge_feedback,
     )
     llm = get_structured_llm("composer", DraftResponse, run_metadata(state))
     try:

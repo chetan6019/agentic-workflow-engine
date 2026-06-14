@@ -131,3 +131,8 @@ class AgentState(BaseModel):
     approval_token: str | None = Field(default=None, description="Token issued for HITL resume.")
     retry_count: int = Field(default=0, ge=0, description="Number of planner retries used.")
     error: str | None = Field(default=None, description="Terminal error code if any.")
+    degraded: list[str] = Field(
+        default_factory=list,
+        description="Non-fatal quality-degradation flags recorded during the run "
+        "(e.g. unresolved hallucination risk, fallback drafts).",
+    )
