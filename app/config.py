@@ -40,6 +40,9 @@ class Settings(BaseSettings):
     # queries the dense named vector only. The collection schema always carries both
     # vectors, so flipping this needs no re-index.
     hybrid_search_enabled: bool = os.getenv("HYBRID_SEARCH_ENABLED", "true").lower() != "false"
+    # Max requests per identity (user_id, or client IP when unauthenticated) per
+    # 60s window, enforced in the API middleware. Override with RATE_LIMIT_PER_MIN.
+    rate_limit_per_min: int = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
 
 
 @lru_cache(maxsize=1)

@@ -8,14 +8,21 @@ from typing import AsyncIterator
 import structlog
 from fastapi import FastAPI, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api import approvals, auth, feedback, health, integrations, invoke, sessions
 from app.config import get_settings
 from app.data.db import init_db
+from app.data.redis_client import check_rate_limit
 from app.logging import configure_logging
 from app.security.jwt_tokens import decode_access_token
 
 log = structlog.get_logger(__name__)
+
+# Liveness/readiness probes are never rate limited or auth-checked.
+_PROBES = {"/healthz", "/readyz"}
+# Paths that don't require a decoded JWT (auth bootstrap + token-based approvals).
+_NO_JWT = _PROBES | {"/v1/auth/register", "/v1/auth/login"}
 
 
 @asynccontextmanager
@@ -26,10 +33,10 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     yield
 
 
-async def _jwt_middleware(request: Request, call_next) -> Response:
-    """Extract the bearer token, decode it, and attach user_id to request.state."""
-    public = {"/healthz", "/readyz", "/v1/auth/register", "/v1/auth/login"}
-    if request.url.path not in public and not request.url.path.startswith("/v1/approvals"):
+async def _auth_and_rate_limit(request: Request, call_next) -> Response:
+    """Decode the bearer token onto request.state, then enforce a per-identity rate limit."""
+    path = request.url.path
+    if path not in _NO_JWT and not path.startswith("/v1/approvals"):
         auth_header = request.headers.get("Authorization", "")
         if auth_header.startswith("Bearer "):
             try:
@@ -38,7 +45,20 @@ async def _jwt_middleware(request: Request, call_next) -> Response:
                 pass
         else:
             request.state.user_id = None
+
+    # Rate limit everything except the probes — by user_id when known, else client IP
+    # (so login/register brute force is throttled too).
+    if path not in _PROBES:
+        identity = getattr(request.state, "user_id", None) or _client_ip(request)
+        if not await check_rate_limit(identity, get_settings().rate_limit_per_min):
+            log.warning("rate_limited", identity=identity, path=path)
+            return JSONResponse(status_code=429, content={"detail": "rate_limit_exceeded"})
     return await call_next(request)
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP for unauthenticated rate-limit bucketing."""
+    return request.client.host if request.client else "anon"
 
 
 def create_app() -> FastAPI:
@@ -48,7 +68,7 @@ def create_app() -> FastAPI:
 
     app = FastAPI(title="Workflow Agent API", version="1.0.0", lifespan=_lifespan)
 
-    app.middleware("http")(_jwt_middleware)
+    app.middleware("http")(_auth_and_rate_limit)
 
     app.add_middleware(
         CORSMiddleware,
