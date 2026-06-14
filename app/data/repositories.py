@@ -11,7 +11,7 @@ from sqlalchemy import select, update
 
 from app.core.state import AgentState, ToolResult
 from app.data.db import get_async_session
-from app.data.models import Approval, AuditLog, Feedback, IntegrationToken, Plan, Session, ToolCall, User
+from app.data.models import Approval, Feedback, IntegrationToken, Plan, Session, ToolCall, User
 
 log = structlog.get_logger(__name__)
 
@@ -153,10 +153,3 @@ async def get_user_providers(user_id: str) -> list[str]:
     async with get_async_session() as s:
         rows = (await s.execute(select(IntegrationToken.provider).where(IntegrationToken.user_id == user_id))).scalars().all()
         return list(rows)
-
-
-async def log_action(user_id: str, action: str, detail: str | None = None) -> None:
-    """Append an audit log entry for the given user action."""
-    async with get_async_session() as s:
-        s.add(AuditLog(user_id=user_id, action=action, detail=detail))
-        log.debug("audit_log", user_id=user_id, action=action)

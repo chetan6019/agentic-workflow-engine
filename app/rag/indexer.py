@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import uuid
 import structlog
 
 from qdrant_client.http.models import PointStruct
@@ -35,15 +34,3 @@ async def index_plan(state: AgentState) -> None:
     )
     get_qdrant().upsert(collection_name="plans", points=[point])
     log.info("plan_indexed", trace_id=state.trace_id)
-
-
-async def index_preference(user_id: str, kind: str, text: str) -> None:
-    """Embed and upsert a user preference into the Qdrant preferences collection."""
-    vec = await embed_named(text)
-    point = PointStruct(
-        id=str(uuid.uuid4()),
-        vector=vec,
-        payload={"user_id": user_id, "kind": kind, "text": text},
-    )
-    get_qdrant().upsert(collection_name="preferences", points=[point])
-    log.info("preference_indexed", user_id=user_id, kind=kind)

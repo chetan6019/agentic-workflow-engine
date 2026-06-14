@@ -1,4 +1,4 @@
-"""POST /v1/invoke and GET /v1/invoke/stream/{trace_id}."""
+"""POST /v1/invoke plus the phase/result polling endpoints the UI uses."""
 
 from __future__ import annotations
 
@@ -8,7 +8,6 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
-from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.state import AgentState
@@ -19,8 +18,6 @@ from app.orchestration.graph import compile_graph
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
 
-_SSE_CHANNEL = "sse:{trace_id}"
-_DONE = json.dumps({"done": True})
 # Hold strong refs to background runs so they aren't garbage-collected mid-await
 # (asyncio only weakly references tasks; a dropped ref can cancel the run).
 _BG_TASKS: set[asyncio.Task] = set()
@@ -81,43 +78,6 @@ async def _set_phase(trace_id: str, label: str, *, done: bool = False) -> None:
     await get_redis().set(_PHASE_KEY.format(trace_id=trace_id), payload, ex=_PHASE_TTL)
 
 
-async def _publish(trace_id: str, payload: str) -> None:
-    """Publish one SSE frame to the trace's Redis pubsub channel."""
-    redis = get_redis()
-    await redis.publish(_SSE_CHANNEL.format(trace_id=trace_id), payload)
-
-
-async def _run_and_publish(initial: AgentState) -> None:
-    """Stream graph state updates to Redis pubsub and persist the final state."""
-    compiled = compile_graph()
-    config = {"configurable": {"thread_id": initial.trace_id}}
-    frames = 0
-    final_state = initial
-    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
-    try:
-        async for chunk in compiled.astream(initial, config=config, stream_mode="values"):
-            try:
-                final_state = AgentState.model_validate(chunk)
-                payload = final_state.model_dump_json()
-            except Exception:
-                payload = json.dumps({"partial": True})
-            await _publish(initial.trace_id, payload)
-            frames += 1
-    except Exception as exc:
-        log.exception("workflow_run_failed", trace_id=initial.trace_id, error=str(exc))
-        final_state.error = final_state.error or str(exc)
-        await _publish(initial.trace_id, json.dumps({"error": str(exc)}))
-    finally:
-        # Persist the final state so the UI can fetch the result even if SSE
-        # frames were missed (idempotent with the finalize-phase save_plan).
-        try:
-            await save_plan(final_state)
-        except Exception as exc:
-            log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
-        log.info("workflow_run_done", trace_id=initial.trace_id, frames=frames)
-        await _publish(initial.trace_id, _DONE)
-
-
 async def _run_workflow_with_phase(initial: AgentState) -> None:
     """Run the graph in the background, updating Redis phase + persisting the state."""
     compiled = compile_graph()
@@ -175,37 +135,6 @@ async def invoke_phase(trace_id: str) -> dict:
     if not raw:
         return {"phase": "pending", "done": False}
     return json.loads(raw)
-
-
-async def _sse_stream(trace_id: str):
-    """Yield SSE frames from the trace's Redis pubsub channel until done."""
-    redis = get_redis()
-    pubsub = redis.pubsub()
-    channel = _SSE_CHANNEL.format(trace_id=trace_id)
-    await pubsub.subscribe(channel)
-    log.info("sse_subscribed", trace_id=trace_id)
-    try:
-        async for msg in pubsub.listen():
-            if msg is None or msg.get("type") != "message":
-                continue
-            data = msg.get("data")
-            if isinstance(data, bytes):
-                data = data.decode("utf-8")
-            yield f"data: {data}\n\n"
-            if data == _DONE:
-                break
-    except asyncio.CancelledError:
-        log.info("sse_client_disconnected", trace_id=trace_id)
-    finally:
-        await pubsub.unsubscribe(channel)
-        await pubsub.aclose()
-        log.debug("sse_unsubscribed", trace_id=trace_id)
-
-
-@router.get("/invoke/stream/{trace_id}")
-async def invoke_stream(trace_id: str) -> StreamingResponse:
-    """Server-Sent Events stream of state updates for a trace."""
-    return StreamingResponse(_sse_stream(trace_id), media_type="text/event-stream")
 
 
 @router.get("/invoke/result/{trace_id}")
