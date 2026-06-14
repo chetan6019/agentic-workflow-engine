@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Literal
 
 import structlog
 
 import datetime
+from zoneinfo import ZoneInfo
 
 from app.agents.response_composer import compose
+from app.config import get_settings
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
 from app.mcp.client import get_mcp_client
@@ -17,8 +18,6 @@ from app.rag.indexer import index_plan
 from app.rag.retriever import retrieve
 
 log = structlog.get_logger(__name__)
-
-Phase = Literal["entry", "execute", "finalize", "noop"]
 
 # Deletions always need human approval BEFORE they run, gated pre-execution here so we
 # never approve a removal that already happened. Updates are NOT pre-gated: an update is
@@ -40,10 +39,19 @@ def _conflict_result(results: list[ToolResult]) -> ToolResult | None:
     return None
 
 
+def _tz_label() -> str:
+    """Short zone abbreviation (e.g. 'IST') for the configured default timezone."""
+    tz = get_settings().default_tz
+    try:
+        return datetime.datetime.now(ZoneInfo(tz)).strftime("%Z") or tz
+    except Exception:
+        return tz
+
+
 def _fmt_local(ts: str) -> str:
     """Render an RFC3339 timestamp as a friendly local time, e.g. 'Mon 15 Jun 2026, 11:00 IST'."""
     try:
-        return datetime.datetime.fromisoformat(ts).strftime("%a %d %b %Y, %H:%M") + " IST"
+        return datetime.datetime.fromisoformat(ts).strftime("%a %d %b %Y, %H:%M") + f" {_tz_label()}"
     except ValueError:
         return ts
 
@@ -106,17 +114,6 @@ def _conflict_draft(conflict: ToolResult) -> DraftResponse:
         pending = ["No free slot found in the next 7 days"]
     return DraftResponse(summary=summary, detail_markdown=detail,
                          actions_taken=[], actions_pending=pending, citations=[])
-
-
-def _phase(state: AgentState) -> Phase:
-    """Decide which phase to run based on which state fields are populated."""
-    if state.plan is None and not state.retrieved_plans:
-        return "entry"
-    if state.plan is not None and not state.tool_results:
-        return "execute"
-    if state.draft is not None and state.confidence > 0.0:
-        return "finalize"
-    return "noop"
 
 
 def _topo_levels(steps: list[PlanStep]) -> list[list[PlanStep]]:
@@ -232,7 +229,11 @@ async def _run_finalize(state: AgentState) -> AgentState:
 async def orchestrator_node(state: AgentState) -> AgentState:
     """Dispatch to the correct phase handler based on current state."""
     structlog.contextvars.bind_contextvars(trace_id=state.trace_id, user_id=state.user_id)
-    phase = _phase(state)
+    if state.error:
+        # A prior node (e.g. a failed planner) set an error; do no work — the router
+        # ends the run. Guards against re-running the entry phase after planner failure.
+        return state
+    phase = state.phase
     log.info("orchestrator_node", phase=phase)
     try:
         if phase == "entry":

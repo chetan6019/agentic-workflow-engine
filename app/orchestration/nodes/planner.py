@@ -102,6 +102,11 @@ async def planner_node(state: AgentState) -> AgentState:
         return state
 
     state.plan = plan
+    # A fresh plan advances the explicit phase to execute and clears any verdict left
+    # over from a re-plan, so the next orchestrator pass executes and the post-execute
+    # router (verdict is None) sends the draft back to guardrails.
+    state.phase = "execute"
+    state.verdict = None
     log.info("planner_node_done", steps=len(plan.steps), strategy=plan.strategy,
              complexity=plan.complexity_score)
     return state

@@ -117,6 +117,8 @@ async def _compose_direct_answer(state: AgentState, preferences: list[str],
     except _SCHEMA_ERRORS as exc:
         log.warning("direct_answer_schema_fallback",
                     trace_id=state.trace_id, error=str(exc))
+        if "direct_answer_fallback" not in state.degraded:
+            state.degraded.append("direct_answer_fallback")
         draft = DraftResponse(
             summary="I couldn't generate a response.",
             detail_markdown=(
@@ -164,6 +166,8 @@ async def compose(state: AgentState, judge_feedback: str | None = None) -> Draft
         draft: DraftResponse = await llm.ainvoke(messages)
     except _SCHEMA_ERRORS as exc:
         log.warning("composer_schema_fallback", trace_id=state.trace_id, error=str(exc))
+        if "composer_fallback_draft" not in state.degraded:
+            state.degraded.append("composer_fallback_draft")
         draft = _fallback_draft(state)
     draft = _inject_failures(draft, state)
     log.info("draft_composed", trace_id=state.trace_id,

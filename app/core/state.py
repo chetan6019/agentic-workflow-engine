@@ -131,6 +131,16 @@ class AgentState(BaseModel):
     approval_token: str | None = Field(default=None, description="Token issued for HITL resume.")
     retry_count: int = Field(default=0, ge=0, description="Number of planner retries used.")
     error: str | None = Field(default=None, description="Terminal error code if any.")
+    phase: Literal["entry", "execute", "finalize", "noop"] = Field(
+        default="entry",
+        description="Explicit orchestrator phase, advanced by the nodes. Replaces the old "
+        "field-presence inference so dispatch never depends on sentinel values.",
+    )
+    verdict: Literal["finalize", "hitl", "replan", "block"] | None = Field(
+        default=None,
+        description="Guardrails routing decision. Set by guardrails_node (with its state "
+        "changes); the graph routers only READ it, so routing stays a pure function.",
+    )
     degraded: list[str] = Field(
         default_factory=list,
         description="Non-fatal quality-degradation flags recorded during the run "
