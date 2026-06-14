@@ -12,6 +12,7 @@ from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import get_settings
+from app.core.background import spawn
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
 from app.data.repositories import create_session, get_plan_by_trace_id, save_plan
@@ -20,22 +21,13 @@ from app.orchestration.graph import compile_graph, discard_thread
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
 
-# Runs execute as in-process asyncio tasks on the instance that accepted /invoke;
-# they are NOT durable across a restart of that instance. Two guards bound the
-# blast radius: a per-run timeout (run_timeout_sec) marks a hung run failed in
-# process, and /invoke/result reconciles a run whose phase key has vanished
-# (worker gone) to a failed state. Approval RESUME is restart-tolerant because it
-# rebuilds from Postgres and can land on any instance.
-# Hold strong refs to background runs so they aren't garbage-collected mid-await
-# (asyncio only weakly references tasks; a dropped ref can cancel the run).
-_BG_TASKS: set[asyncio.Task] = set()
-
-
-def _spawn(coro) -> None:
-    """Run a coroutine in the background, keeping a reference until it finishes."""
-    task = asyncio.create_task(coro)
-    _BG_TASKS.add(task)
-    task.add_done_callback(_BG_TASKS.discard)
+# Runs execute as in-process asyncio tasks (via core.background.spawn, so shutdown
+# can drain them) on the instance that accepted /invoke; they are NOT durable
+# across a restart of that instance. Two guards bound the blast radius: a per-run
+# timeout (run_timeout_sec) marks a hung run failed in process, and
+# /invoke/result reconciles a run whose phase key has vanished (worker gone) to a
+# failed state. Approval RESUME is restart-tolerant because it rebuilds from
+# Postgres and can land on any instance.
 
 
 class InvokeRequest(BaseModel):
@@ -146,7 +138,7 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
         requires_approval=req.require_approval,
     )
     await _set_phase(trace_id, "🚀 starting")
-    _spawn(_run_workflow_with_phase(initial))
+    spawn(_run_workflow_with_phase(initial))
     return InvokeResponse(trace_id=trace_id)
 
 

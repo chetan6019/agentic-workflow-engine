@@ -12,9 +12,11 @@ from fastapi.responses import JSONResponse
 
 from app.api import approvals, auth, feedback, health, integrations, invoke, sessions
 from app.config import get_settings
-from app.data.db import init_db
-from app.data.redis_client import check_rate_limit
+from app.core.background import drain
+from app.data.db import get_engine, init_db
+from app.data.redis_client import check_rate_limit, get_redis
 from app.logging import configure_logging
+from app.rag.qdrant_client import get_qdrant
 from app.security.jwt_tokens import decode_access_token
 
 log = structlog.get_logger(__name__)
@@ -23,14 +25,30 @@ log = structlog.get_logger(__name__)
 _PROBES = {"/healthz", "/readyz"}
 # Paths that don't require a decoded JWT (auth bootstrap + token-based approvals).
 _NO_JWT = _PROBES | {"/v1/auth/register", "/v1/auth/login"}
+# Seconds to let in-flight background runs finish on SIGTERM before cancelling.
+_SHUTDOWN_GRACE_SEC = 10
 
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create DB schema before serving; a failure here aborts startup loudly."""
+    """Create DB schema before serving; drain background work and close pools on stop."""
     await init_db()
     log.info("app_started")
     yield
+    await _shutdown()
+
+
+async def _shutdown() -> None:
+    """Drain in-flight background runs, then close DB / Redis / Qdrant cleanly."""
+    await drain(_SHUTDOWN_GRACE_SEC)
+    for name, closer in (("engine", get_engine().dispose),
+                         ("redis", get_redis().aclose),
+                         ("qdrant", get_qdrant().close)):
+        try:
+            await closer()
+        except Exception as exc:
+            log.warning("shutdown_close_failed", resource=name, error=str(exc))
+    log.info("app_stopped")
 
 
 async def _auth_and_rate_limit(request: Request, call_next) -> Response:

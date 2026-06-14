@@ -11,6 +11,7 @@ import structlog
 import datetime
 
 from app.agents.response_composer import compose
+from app.core.background import spawn
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
 from app.mcp.client import get_mcp_client
@@ -225,7 +226,7 @@ async def _run_execute(state: AgentState) -> AgentState:
 async def _run_finalize(state: AgentState) -> AgentState:
     """Persist final plan and schedule background indexing."""
     await save_plan(state)
-    asyncio.create_task(index_plan(state))
+    spawn(index_plan(state))  # tracked so it survives GC and drains on shutdown
     log.info("orchestrator_finalized", confidence=round(state.confidence, 3))
     return state
 
