@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from json import JSONDecodeError
 from statistics import mean
 
@@ -160,6 +161,7 @@ async def _mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> G
 
 async def guardrails_node(state: AgentState) -> AgentState:
     """Score the draft, set confidence + requires_approval, and return updated state."""
+    t0 = time.monotonic()
     log.info("guardrails_node_start", trace_id=state.trace_id)
     should_continue = await _stage_one(state)
     if not should_continue or state.draft is None:
@@ -184,5 +186,6 @@ async def guardrails_node(state: AgentState) -> AgentState:
         log.info("guard_awaiting_approval", trace_id=state.trace_id,
                  confidence=round(state.confidence, 3))
     log.info("guardrails_node_done", confidence=round(state.confidence, 3),
-             requires_approval=state.requires_approval)
+             requires_approval=state.requires_approval,
+             duration_ms=int((time.monotonic() - t0) * 1000))
     return state

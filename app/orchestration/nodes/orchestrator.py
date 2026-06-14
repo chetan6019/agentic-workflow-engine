@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import time
 from typing import Literal
 
 import structlog
@@ -234,15 +235,20 @@ async def orchestrator_node(state: AgentState) -> AgentState:
     structlog.contextvars.bind_contextvars(trace_id=state.trace_id, user_id=state.user_id)
     phase = _phase(state)
     log.info("orchestrator_node", phase=phase)
+    t0 = time.monotonic()
     try:
         if phase == "entry":
-            return await _run_entry(state)
-        if phase == "execute":
-            return await _run_execute(state)
-        if phase == "finalize":
-            return await _run_finalize(state)
-        return state
+            result = await _run_entry(state)
+        elif phase == "execute":
+            result = await _run_execute(state)
+        elif phase == "finalize":
+            result = await _run_finalize(state)
+        else:
+            result = state
     except Exception as exc:
         log.exception("orchestrator_failed", phase=phase, error=str(exc))
         state.error = f"orchestrator_failed:{exc!s}"
-        return state
+        result = state
+    log.info("orchestrator_node_done", phase=phase,
+             duration_ms=int((time.monotonic() - t0) * 1000))
+    return result

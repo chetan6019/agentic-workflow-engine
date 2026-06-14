@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 from uuid import uuid4
 
 import structlog
@@ -83,6 +84,7 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     compiled = compile_graph()
     config = {"configurable": {"thread_id": initial.trace_id}}
     log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
+    started = time.monotonic()
     final_state = initial
     await _set_phase(initial.trace_id, "📥 retrieving context")
     try:
@@ -101,6 +103,7 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
         log.warning("final_state_persist_failed", trace_id=initial.trace_id, error=str(exc))
     await _set_phase(initial.trace_id, _phase_label(final_state), done=True)
     log.info("workflow_run_done", trace_id=initial.trace_id,
+             duration_ms=int((time.monotonic() - started) * 1000),
              has_draft=final_state.draft is not None, error=final_state.error)
 
 

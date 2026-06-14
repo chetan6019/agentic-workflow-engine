@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import time
 from json import JSONDecodeError
 from typing import Any
 from zoneinfo import ZoneInfo
@@ -66,6 +67,7 @@ def _invalid_steps(plan: ExecutionPlan, tool_specs: list[ToolSpec]) -> list[str]
 
 async def planner_node(state: AgentState) -> AgentState:
     """Build an ExecutionPlan from the user request, retrieved plans, and tool specs."""
+    t0 = time.monotonic()
     log.info("planner_node_start", retry_count=state.retry_count,
              examples=len(state.retrieved_plans))
     tool_specs = await fetch_tool_specs(state.user_request, _TOOL_DOC_K)
@@ -118,5 +120,6 @@ async def planner_node(state: AgentState) -> AgentState:
 
     state.plan = plan
     log.info("planner_node_done", steps=len(plan.steps), strategy=plan.strategy,
-             complexity=plan.complexity_score)
+             complexity=plan.complexity_score,
+             duration_ms=int((time.monotonic() - t0) * 1000))
     return state
