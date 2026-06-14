@@ -61,10 +61,17 @@ Output JSON: {"hits": [{"plan_id": str, "relevance": float}]}.
 </instructions>"""
 
 _GUARD_SYS = """<instructions>
-You are a quality judge for AI workflow responses.
-Assess tone fit, hallucination risk, and instruction adherence.
+You are a quality judge for AI workflow responses. You are given the user
+request, the draft response, and <evidence> — the raw tool results the draft is
+supposed to be based on. Score three values in [0.0, 1.0]:
+- tone_fit: alignment with the user's request and style.
+- hallucination_risk: the degree to which the draft makes claims NOT supported by
+  the <evidence>. Every concrete fact in the draft — names, times, counts,
+  statuses, ids — must trace to the evidence. High risk = unsupported or
+  contradicted claims; low risk = every claim is grounded. If <evidence> is empty
+  (a direct conversational answer with no tool calls), judge plausibility instead.
+- instruction_adherence: how fully the draft satisfies the request.
 Output JSON: {"tone_fit": float, "hallucination_risk": float, "instruction_adherence": float}.
-All values must be between 0.0 and 1.0.
 </instructions>"""
 
 _DIRECT_ANSWER_SYS = """<instructions>
@@ -161,10 +168,19 @@ def build_retriever_grader_messages(query: str, candidates: list[Any]) -> list[B
     return [SystemMessage(content=_RETRIEVER_GRADER_SYS), HumanMessage(content=human)]
 
 
-def build_guard_judge_messages(draft: Any, user_request: str) -> list[BaseMessage]:
-    """Build guard-judge prompt from a DraftResponse and the original request."""
+def build_guard_judge_messages(draft: Any, user_request: str,
+                               tool_results: list[Any] | None = None) -> list[BaseMessage]:
+    """Build guard-judge prompt: draft + original request + the tool-result evidence.
+
+    The evidence lets the judge ground hallucination_risk in what the tools
+    actually returned (compacted to trim long email bodies) rather than guessing
+    from the draft alone. Empty for direct/meta answers that ran no tools.
+    """
     draft_text = draft.model_dump_json() if hasattr(draft, "model_dump_json") else json.dumps(draft)
-    human = f"<draft>\n{draft_text}\n</draft>\n\n<request>\n{user_request}\n</request>"
+    evidence = json.dumps(_compact_results(tool_results or []))
+    human = (f"<draft>\n{draft_text}\n</draft>\n\n"
+             f"<evidence>\n{evidence}\n</evidence>\n\n"
+             f"<request>\n{user_request}\n</request>")
     return [SystemMessage(content=_GUARD_SYS), HumanMessage(content=human)]
 
 
@@ -182,8 +198,14 @@ def _compact_results(tool_results: list[Any]) -> list[Any]:
     return compacted
 
 
+def _revision_block(judge_feedback: str | None) -> str:
+    """Optional correction note appended to a re-composition prompt (else empty)."""
+    return f"\n\n<revision_note>\n{judge_feedback}\n</revision_note>" if judge_feedback else ""
+
+
 def build_composer_messages(plan: Any, tool_results: list[Any], preferences: list[Any],
-                            user_request: str, tz_name: str) -> list[BaseMessage]:
+                            user_request: str, tz_name: str,
+                            judge_feedback: str | None = None) -> list[BaseMessage]:
     """Build response-composer prompt with plan, results, user prefs, request, and timezone."""
     plan_text = plan.model_dump_json() if hasattr(plan, "model_dump_json") else json.dumps(plan)
     results_text = json.dumps(_compact_results(tool_results))
@@ -191,14 +213,16 @@ def build_composer_messages(plan: Any, tool_results: list[Any], preferences: lis
     sys = f"{_COMPOSER_SYS}\n<user_style>\n{prefs_text}\n</user_style>"
     human = (f"<context>\nTimezone: {tz_name}\n</context>\n\n"
              f"<plan>\n{plan_text}\n</plan>\n\n<results>\n{results_text}\n</results>\n\n"
-             f"<request>\n{user_request}\n</request>")
+             f"<request>\n{user_request}\n</request>{_revision_block(judge_feedback)}")
     return [SystemMessage(content=sys), HumanMessage(content=human)]
 
 
-def build_direct_answer_messages(user_request: str, tool_specs: list[Any], preferences: list[Any]) -> list[BaseMessage]:
+def build_direct_answer_messages(user_request: str, tool_specs: list[Any], preferences: list[Any],
+                                 judge_feedback: str | None = None) -> list[BaseMessage]:
     """Build prompt for direct conversational answers when no tools are needed."""
     tools_block = json.dumps([t.model_dump() if hasattr(t, "model_dump") else t for t in tool_specs])
     prefs_text = "\n".join(str(p) for p in preferences[:3]) if preferences else "No preferences stored."
     sys = f"{_DIRECT_ANSWER_SYS}\n<user_style>\n{prefs_text}\n</user_style>"
-    human = f"<tools>\n{tools_block}\n</tools>\n\n<request>\n{user_request}\n</request>"
+    human = (f"<tools>\n{tools_block}\n</tools>\n\n"
+             f"<request>\n{user_request}\n</request>{_revision_block(judge_feedback)}")
     return [SystemMessage(content=sys), HumanMessage(content=human)]
