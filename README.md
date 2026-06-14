@@ -1,6 +1,6 @@
 # Agentic Workflow Engine
 
-An interview-grade AI workflow automation platform. A user types a natural-language request into a Streamlit chat (or hits the FastAPI endpoint); a LangGraph state machine plans the work with an LLM, retrieves context from Qdrant, executes tool calls through custom MCP servers (Calendar, Gmail, Notion, Slack), gates risky steps behind a human approval flow, and streams the answer back.
+An interview-grade AI workflow automation platform. A user types a natural-language request into a Streamlit chat (or hits the FastAPI endpoint); a LangGraph state machine plans the work with an LLM, retrieves context from Qdrant, executes tool calls through custom MCP servers (Calendar, Gmail, Notion, Slack), gates risky steps behind a human approval flow, and returns the answer while the UI polls live phase progress.
 
 ---
 
@@ -10,7 +10,7 @@ An interview-grade AI workflow automation platform. A user types a natural-langu
 User (Streamlit :8501)
     │
     ▼
-FastAPI (:8000)   ← JWT auth, rate limits, SSE streaming
+FastAPI (:8000)   ← JWT auth, sessions, approvals, phase polling
     │
     ▼
 LangGraph StateGraph
@@ -21,7 +21,7 @@ LangGraph StateGraph
     └── guardrails → confidence score → finalize | HITL | re-plan | block
     │
     ▼
-PostgreSQL (system of record)  Redis (cache, rate limits, SSE pub/sub)
+PostgreSQL (system of record)  Redis (cache, idempotency, hot state, phase)
 LiteLLM proxy (:4000)          Qdrant (:6333)
 Langfuse (LLM trace viewer)
 ```
@@ -33,7 +33,7 @@ Langfuse (LLM trace viewer)
 ### Prerequisites
 
 - Docker + Docker Compose
-- Python 3.12
+- Python 3.13
 - [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`
 
 ### 1. Clone and configure
@@ -57,7 +57,7 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ### 2. Start infrastructure
 
 ```bash
-docker compose -f infra/docker-compose.yml up -d postgres redis qdrant litellm-proxy
+docker compose up -d postgres redis qdrant litellm-proxy
 ```
 
 ### 3. Install Python dependencies
@@ -90,7 +90,7 @@ Open `http://localhost:8501` — log in with `demo` / `demo123`.
 ### 6. Run everything with Docker Compose
 
 ```bash
-docker compose -f infra/docker-compose.yml up --build
+docker compose up --build
 ```
 
 ---
@@ -128,7 +128,7 @@ uv run mypy app/core/state.py --strict
 uv run pytest
 
 # Run a single test
-uv run pytest tests/unit/test_repositories.py -xvs
+uv run pytest tests/test_graph_routing.py -xvs
 ```
 
 ---
@@ -152,18 +152,18 @@ app/
 streamlit_app/
   app.py          Streamlit UI (chat, plan inspector, history, HITL)
   styles.py       CSS injection helpers
+docker-compose.yml       Full service stack (run from the repo root)
 infra/
-  docker-compose.yml     Full 10-service stack
   litellm_config.yaml    LiteLLM model aliases + caching config
+  Dockerfile.base        Shared dependency image
   Dockerfile.api         FastAPI container
   Dockerfile.mcp         MCP server container
   Dockerfile.streamlit   Streamlit container
+alembic/                 Schema migrations (alembic upgrade head)
 scripts/
   seed_demo_data.py      Creates demo user + 20 seed plans in Qdrant
   index_tool_docs.py     Indexes MCP tool docstrings into Qdrant
-tests/
-  unit/
-  integration/
+tests/                   Flat pytest suite (routing, approval, guard, MCP, retrieval…)
 ```
 
 ---
@@ -187,8 +187,8 @@ tests/
 - **FastMCP** — MCP server implementation (Calendar, Gmail, Notion, Slack)
 - **langchain-mcp-adapters** — MCP client connectivity into LangChain/LangGraph
 - **Qdrant** — vector database for plans, preferences, tool capability docs
-- **FastAPI** — async REST API with JWT auth, rate limiting, SSE streaming
+- **FastAPI** — async REST API with JWT auth, sessions, approvals; UI polls live phase
 - **Streamlit** — dark-themed chat UI with approval inbox and plan inspector
 - **PostgreSQL** — system of record (users, sessions, plans, approvals, tokens)
-- **Redis** — rate limits, idempotency keys, embedding cache, SSE pub/sub
+- **Redis** — idempotency keys, embedding cache, hot workflow state, phase polling
 - **structlog** — structured JSON logging; **Langfuse** — LLM trace visualization
