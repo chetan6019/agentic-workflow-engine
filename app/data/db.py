@@ -1,4 +1,11 @@
-"""Async SQLAlchemy engine and session factory."""
+"""Async SQLAlchemy engine, session factory, and dev-time schema bootstrap.
+
+Schema ownership: Alembic (``alembic upgrade head``, see ``alembic/``) is the
+authoritative migration tool for real deployments. ``init_db`` below keeps a
+``create_all`` fast-path purely for zero-friction local/demo startup; its initial
+state matches Alembic revision 0001. Evolve the schema by adding Alembic
+revisions, not by extending the legacy ``_MIGRATIONS`` list.
+"""
 
 from __future__ import annotations
 
@@ -40,8 +47,8 @@ async def get_async_session():
             raise
 
 
-# Lightweight idempotent migrations for columns added after a table first shipped
-# (create_all never alters existing tables).
+# Legacy in-place tweaks for the create_all dev path only (create_all never alters
+# existing tables). New schema changes belong in Alembic revisions, not here.
 _MIGRATIONS = [
     "ALTER TABLE sessions ADD COLUMN IF NOT EXISTS title VARCHAR(200)",
 ]

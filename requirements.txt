@@ -26,6 +26,8 @@ sqlalchemy[asyncio]
 asyncpg
 redis
 qdrant-client
+# Schema migrations (alembic upgrade head); see alembic/ and app/data/db.py.
+alembic
 # BM25 sparse vectors for hybrid (dense+sparse) retrieval. Pure-lexical, CPU-only,
 # not an LLM embedding — so it does not violate the LiteLLM-only embedding rule.
 fastembed
