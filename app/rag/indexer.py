@@ -29,7 +29,10 @@ async def index_plan(state: AgentState) -> None:
             "plan_json": state.plan.model_dump(),
             "summary": state.plan.reasoning[:200],
             "user_id": state.user_id,
-            "success": state.error is None,
+            # A run is a "successful" exemplar only if it had no terminal error AND every
+            # tool step actually succeeded — a finalized run with a failed step must not
+            # be retrieved as a model for future planners (REVIEW.md R30).
+            "success": state.error is None and all(r.ok for r in state.tool_results),
         },
     )
     await get_qdrant().upsert(collection_name="plans", points=[point])

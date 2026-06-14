@@ -56,13 +56,8 @@ async def _auth_and_rate_limit(request: Request, call_next) -> Response:
     path = request.url.path
     if path not in _NO_JWT and not path.startswith("/v1/approvals"):
         auth_header = request.headers.get("Authorization", "")
-        if auth_header.startswith("Bearer "):
-            try:
-                request.state.user_id = decode_access_token(auth_header.removeprefix("Bearer "))
-            except Exception:
-                pass
-        else:
-            request.state.user_id = None
+        token = auth_header.removeprefix("Bearer ") if auth_header.startswith("Bearer ") else ""
+        request.state.user_id = decode_access_token(token) if token else None
 
     # Rate limit everything except the probes — by user_id when known, else client IP
     # (so login/register brute force is throttled too).

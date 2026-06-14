@@ -23,8 +23,9 @@ jobs:
       - name: Lint (ruff)
         run: ruff check app/ streamlit_app/ scripts/ tests/
 
-      # Advisory until REVIEW.md R5 lands: config.py's os.getenv defaults
-      # legitimately fail strict typing today. Flip to gating once fixed.
+      # R5 landed (config.py is now plain typed fields), but the rest of app/ is
+      # not yet fully mypy-clean. Keep advisory until a clean `mypy app/` pass,
+      # then flip to gating.
       - name: Type check (mypy, advisory)
         run: mypy app/
         continue-on-error: true

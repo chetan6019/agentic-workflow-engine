@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from fastapi import HTTPException
 from jose import JWTError, jwt
 
 from app.config import get_settings
@@ -23,14 +22,16 @@ def create_access_token(user_id: str) -> str:
     return jwt.encode(payload, s.jwt_secret, algorithm=_ALGORITHM)
 
 
-def decode_access_token(token: str) -> str:
-    """Decode and verify a JWT; return the user_id or raise HTTPException(401)."""
+def decode_access_token(token: str) -> str | None:
+    """Decode and verify a JWT; return the user_id, or None if invalid/expired.
+
+    The security layer returns a domain value rather than raising a web error —
+    callers (the JWT middleware) translate a None into the right HTTP response.
+    """
     s = get_settings()
     try:
         payload = jwt.decode(token, s.jwt_secret, algorithms=[_ALGORITHM])
-        user_id: str | None = payload.get("sub")
-        if not user_id:
-            raise HTTPException(status_code=401, detail="invalid_token")
-        return user_id
-    except JWTError as exc:
-        raise HTTPException(status_code=401, detail=f"token_error: {exc}") from exc
+    except JWTError:
+        return None
+    user_id = payload.get("sub")
+    return user_id if isinstance(user_id, str) and user_id else None

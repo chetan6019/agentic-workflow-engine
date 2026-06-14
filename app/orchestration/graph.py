@@ -10,29 +10,26 @@ from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
 from app.core.state import AgentState
-from app.orchestration.nodes.guard import (
-    _HIGH_CONFIDENCE,
-    _HITL_ENABLED,
-    _LOW_CONFIDENCE,
-    guardrails_node,
-)
+from app.orchestration.nodes.guard import guardrails_node
 from app.orchestration.nodes.orchestrator import orchestrator_node
 from app.orchestration.nodes.planner import planner_node
 
 log = structlog.get_logger(__name__)
 
-_MAX_RETRIES = 2
-
 
 def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrails", "__end__"]:
-    """Route to planner before a plan exists, to guardrails once a draft exists."""
+    """Route to planner before a plan exists, to guardrails once an unscored draft exists.
+
+    Pure: reads state only. ``verdict is None`` means guardrails hasn't run yet, so a
+    fresh draft is sent there to be scored; once a verdict exists the run is done.
+    """
     if state.error:
         dest: str = END
     elif state.plan is None:
         dest = "planner"
     elif state.requires_approval and state.approval_token:
         dest = END  # paused for HITL (plan-stage gate or calendar-conflict approval)
-    elif state.draft is not None and state.confidence == 0.0:
+    elif state.draft is not None and state.verdict is None:
         dest = "guardrails"
     else:
         dest = END
@@ -42,30 +39,17 @@ def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrai
 
 
 def _route_after_guard(state: AgentState) -> Literal["planner", "orchestrator", "__end__"]:
-    """Finalize, pause for HITL, retry, or block — based on guard confidence."""
-    conf = state.confidence
+    """Map the verdict guardrails_node set onto a destination — pure, no mutation (R6)."""
     if state.error:
         dest: str = END
-    elif conf >= _LOW_CONFIDENCE:
-        # >= 0.85 always finalizes. The 0.55–0.85 band finalizes too while HITL
-        # is idle; flip _HITL_ENABLED to pause it for approval instead.
-        if _HITL_ENABLED and conf < _HIGH_CONFIDENCE:
-            state.requires_approval = True  # UI shows HITL; approval re-invokes the graph
-            dest = END
-        else:
-            dest = "orchestrator"  # proceed to finalize/persist
-    elif state.retry_count < _MAX_RETRIES:
-        state.retry_count += 1
-        state.plan = None
-        state.tool_results = []
-        state.draft = None
-        state.confidence = 0.0
+    elif state.verdict == "finalize":
+        dest = "orchestrator"  # proceed to finalize/persist
+    elif state.verdict == "replan":
         dest = "planner"
-    else:
-        state.error = "low_confidence_blocked"
+    else:  # "hitl", "block", or None — nothing left to run in the graph
         dest = END
-    log.info("route_after_guard", dest=dest, confidence=round(conf, 3),
-             retry_count=state.retry_count, requires_approval=state.requires_approval)
+    log.info("route_after_guard", dest=dest, verdict=state.verdict,
+             confidence=round(state.confidence, 3), retry_count=state.retry_count)
     return dest  # type: ignore[return-value]
 
 

@@ -1,4 +1,4 @@
-"""POST /v1/invoke plus the phase/result polling endpoints the UI uses."""
+"""POST /v1/invoke plus the phase/result polling endpoints the UI reads."""
 
 from __future__ import annotations
 
@@ -67,7 +67,7 @@ def _phase_label(state: AgentState) -> str:
         return "❌ failed"
     if state.requires_approval:
         return "🛑 awaiting approval"
-    if state.draft and state.confidence > 0:
+    if state.draft and state.verdict is not None:
         return "💾 finalizing"
     if state.draft:
         return "🛡️ checking quality"
@@ -80,9 +80,14 @@ def _phase_label(state: AgentState) -> str:
     return "📥 retrieving context"
 
 
-async def _set_phase(trace_id: str, label: str, *, done: bool = False) -> None:
-    """Write the current phase to Redis so the UI can poll it."""
-    payload = json.dumps({"phase": label, "done": done})
+async def _set_phase(trace_id: str, label: str, owner: str,
+                     *, done: bool = False) -> None:
+    """Write the current phase (+ owner) to Redis so the UI can poll it.
+
+    ``owner`` lets the poll endpoint enforce ownership without a DB round-trip on
+    every tick — the run's user_id travels with the phase key (REVIEW.md R15).
+    """
+    payload = json.dumps({"phase": label, "done": done, "owner": owner})
     await get_redis().set(_PHASE_KEY.format(trace_id=trace_id), payload, ex=_PHASE_TTL)
 
 
@@ -90,7 +95,8 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     """Run the graph in the background, updating Redis phase + persisting the state."""
     compiled = compile_graph()
     config = {"configurable": {"thread_id": initial.trace_id}}
-    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=initial.user_id)
+    owner = initial.user_id
+    log.info("workflow_run_start", trace_id=initial.trace_id, user_id=owner)
     started = time.monotonic()
     holder = {"state": initial}  # mutable so a timeout still sees the latest state
 
@@ -100,9 +106,9 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
                 holder["state"] = AgentState.model_validate(chunk)
             except Exception:
                 continue
-            await _set_phase(initial.trace_id, _phase_label(holder["state"]))
+            await _set_phase(initial.trace_id, _phase_label(holder["state"]), owner)
 
-    await _set_phase(initial.trace_id, "📥 retrieving context")
+    await _set_phase(initial.trace_id, "📥 retrieving context", owner)
     try:
         await asyncio.wait_for(_stream(), timeout=get_settings().run_timeout_sec)
     except asyncio.TimeoutError:
@@ -127,7 +133,7 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     # State is now in Postgres; drop the in-memory checkpoint (resume rebuilds
     # from Postgres, so it's never read again — see discard_thread).
     await discard_thread(initial.trace_id)
-    await _set_phase(initial.trace_id, _phase_label(final_state), done=True)
+    await _set_phase(initial.trace_id, _phase_label(final_state), owner, done=True)
     log.info("workflow_run_done", trace_id=initial.trace_id,
              duration_ms=int((time.monotonic() - started) * 1000),
              has_draft=final_state.draft is not None, error=final_state.error)
@@ -163,40 +169,57 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
         history=history,
         requires_approval=req.require_approval,
     )
-    await _set_phase(trace_id, "🚀 starting")
+    await _set_phase(trace_id, "🚀 starting", user_id)
     spawn(_run_workflow_with_phase(initial))
     return InvokeResponse(trace_id=trace_id)
 
 
+def _require_user(request: Request) -> str:
+    """Return the authenticated user_id or raise 401 (JWT middleware sets it)."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    return user_id
+
+
 @router.get("/invoke/phase/{trace_id}")
-async def invoke_phase(trace_id: str) -> dict:
+async def invoke_phase(trace_id: str, request: Request) -> dict:
     """Return the current workflow phase for live progress, polled by the UI."""
+    user_id = _require_user(request)
     raw = await get_redis().get(_PHASE_KEY.format(trace_id=trace_id))
     if not raw:
         return {"phase": "pending", "done": False}
-    return json.loads(raw)
+    data = json.loads(raw)
+    # Ownership: the run's user_id rides with the phase key, so a caller can only
+    # see progress for their own runs (REVIEW.md R15). No DB hit on the poll path.
+    if data.get("owner") and data["owner"] != user_id:
+        raise HTTPException(status_code=404, detail="not_found")
+    return {"phase": data.get("phase", "pending"), "done": data.get("done", False)}
 
 
 @router.get("/invoke/result/{trace_id}")
-async def invoke_result(trace_id: str) -> dict:
+async def invoke_result(trace_id: str, request: Request) -> dict:
     """Authoritative final state for a trace, read from the persisted plan.
 
-    The UI polls this for the final answer. The plan row is written mid-run
-    (before the draft exists, to satisfy the tool_calls FK), so we mark it 'done'
-    once any reliable terminal signal is present: an error, a populated draft, or
-    a non-zero confidence (which only gets set after guardrails runs, i.e. after
-    the graph fully completes).
+    Requires a valid JWT and ownership of the run (REVIEW.md R15) — the final state
+    can contain emails and calendar contents. The plan row is written mid-run (before
+    the draft exists, to satisfy the tool_calls FK), so we mark it 'done' once a
+    reliable terminal signal is present: an error, a populated draft, or a guardrails
+    verdict (set only after the graph completes scoring).
 
     Reconciliation: if the row exists with no terminal signal AND the phase key
     has vanished, the worker that owned this run is gone (e.g. instance restart);
     report it failed rather than 'pending' forever.
     """
+    user_id = _require_user(request)
     row = await get_plan_by_trace_id(trace_id)
     if not row:
         return {"status": "pending"}
+    if row.get("user_id") != user_id:
+        raise HTTPException(status_code=404, detail="not_found")
     state = json.loads(row["state_json"])
     draft_md = (state.get("draft") or {}).get("detail_markdown")
-    done = bool(draft_md) or bool(state.get("error")) or float(state.get("confidence") or 0) > 0
+    done = bool(draft_md) or bool(state.get("error")) or state.get("verdict") is not None
     if done:
         return {"status": "done", "state": state}
     if not await get_redis().get(_PHASE_KEY.format(trace_id=trace_id)):

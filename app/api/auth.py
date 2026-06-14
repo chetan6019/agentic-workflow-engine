@@ -12,7 +12,7 @@ from app.data.repositories import (
     get_user_by_username,
     get_user_providers,
 )
-from app.security.jwt_tokens import create_access_token, decode_access_token
+from app.security.jwt_tokens import create_access_token
 from app.security.passwords import hash_password, verify_password
 
 log = structlog.get_logger(__name__)
@@ -56,10 +56,9 @@ async def login(req: LoginRequest) -> dict:
 @router.get("/me")
 async def me(request: Request) -> dict:
     """Return the currently authenticated user's profile."""
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="missing_token")
-    user_id = decode_access_token(auth.removeprefix("Bearer "))
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthenticated")
     user = await get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=404, detail="user_not_found")

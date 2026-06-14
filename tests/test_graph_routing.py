@@ -1,8 +1,10 @@
 """Routing-band tests for the LangGraph conditional edges, plus DAG levelling.
 
-These drive ``_route_after_orchestrator`` / ``_route_after_guard`` as plain
-functions — no LLM, no DB, no compiled graph — so every band of the guardrails
-routing table (finalize / HITL / re-plan / block) is pinned down cheaply.
+The bands now live in ``guard._decide_verdict`` (which mutates state) and the graph
+routers are pure readers of ``state.verdict`` (REVIEW.md R6). So these tests cover two
+layers: ``_decide_verdict`` for the finalize / HITL / re-plan / block decision + its
+state changes, and the routers for the verdict → destination mapping. No LLM, DB, or
+compiled graph involved.
 """
 
 from __future__ import annotations
@@ -12,6 +14,7 @@ from langgraph.graph import END
 
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.orchestration import graph
+from app.orchestration.nodes import guard
 from app.orchestration.nodes.orchestrator import _topo_levels
 
 
@@ -51,57 +54,86 @@ def test_orchestrator_hitl_pause_routes_to_end():
 
 
 def test_orchestrator_unscored_draft_routes_to_guardrails():
-    s = _state(plan=_plan(), draft=_draft())  # confidence defaults to 0.0
+    s = _state(plan=_plan(), draft=_draft())  # verdict defaults to None → unscored
     assert graph._route_after_orchestrator(s) == "guardrails"
 
 
 def test_orchestrator_scored_draft_routes_to_end():
-    s = _state(plan=_plan(), draft=_draft(), confidence=0.9)
+    s = _state(plan=_plan(), draft=_draft(), verdict="finalize")
     assert graph._route_after_orchestrator(s) == END
 
 
-# ── _route_after_guard ───────────────────────────────────────────────────────
+# ── _route_after_guard (pure verdict → destination mapping) ───────────────────
 
 
 def test_guard_error_routes_to_end():
-    assert graph._route_after_guard(_state(error="boom", confidence=0.9)) == END
+    assert graph._route_after_guard(_state(error="boom", verdict="finalize")) == END
 
 
-def test_guard_high_confidence_finalizes():
-    assert graph._route_after_guard(_state(confidence=0.9)) == "orchestrator"
+def test_guard_finalize_routes_to_orchestrator():
+    assert graph._route_after_guard(_state(verdict="finalize")) == "orchestrator"
 
 
-def test_guard_medium_band_finalizes_while_hitl_disabled():
+def test_guard_replan_routes_to_planner():
+    assert graph._route_after_guard(_state(verdict="replan")) == "planner"
+
+
+def test_guard_hitl_routes_to_end():
+    assert graph._route_after_guard(_state(verdict="hitl")) == END
+
+
+def test_guard_block_routes_to_end():
+    assert graph._route_after_guard(_state(verdict="block", error="low_confidence_blocked")) == END
+
+
+# ── guard._decide_verdict (the routing bands + their state changes, R6) ────────
+
+
+def test_decide_high_confidence_finalizes():
+    s = _state(confidence=0.9)
+    guard._decide_verdict(s)
+    assert s.verdict == "finalize"
+    assert s.phase == "finalize"
+
+
+def test_decide_medium_band_finalizes_while_hitl_disabled():
     """0.55–0.85 auto-finalizes while _HITL_ENABLED is False (current default)."""
     s = _state(confidence=0.7)
-    assert graph._route_after_guard(s) == "orchestrator"
+    guard._decide_verdict(s)
+    assert s.verdict == "finalize"
     assert s.requires_approval is False
 
 
-def test_guard_medium_band_pauses_when_hitl_enabled(monkeypatch):
-    """Flipping _HITL_ENABLED makes the medium band pause for approval."""
-    monkeypatch.setattr(graph, "_HITL_ENABLED", True)
+def test_decide_medium_band_hitl_when_enabled(monkeypatch):
+    """Flipping _HITL_ENABLED makes the medium band ask for approval."""
+    monkeypatch.setattr(guard, "_HITL_ENABLED", True)
     s = _state(confidence=0.7)
-    assert graph._route_after_guard(s) == END
+    guard._decide_verdict(s)
+    assert s.verdict == "hitl"
     assert s.requires_approval is True
 
 
-def test_guard_boundary_085_finalizes_even_with_hitl(monkeypatch):
+def test_decide_boundary_085_finalizes_even_with_hitl(monkeypatch):
     """conf == 0.85 is outside the HITL band — always finalizes."""
-    monkeypatch.setattr(graph, "_HITL_ENABLED", True)
-    assert graph._route_after_guard(_state(confidence=0.85)) == "orchestrator"
+    monkeypatch.setattr(guard, "_HITL_ENABLED", True)
+    s = _state(confidence=0.85)
+    guard._decide_verdict(s)
+    assert s.verdict == "finalize"
 
 
-def test_guard_boundary_055_is_not_a_replan():
-    assert graph._route_after_guard(_state(confidence=0.55)) == "orchestrator"
+def test_decide_boundary_055_is_not_a_replan():
+    s = _state(confidence=0.55)
+    guard._decide_verdict(s)
+    assert s.verdict == "finalize"
 
 
-def test_guard_low_confidence_replans_and_resets_state():
+def test_decide_low_confidence_replans_and_resets_state():
     s = _state(
         confidence=0.4, retry_count=0, plan=_plan(), draft=_draft(),
         tool_results=[ToolResult(step_id="s1", ok=True, output={}, error=None, latency_ms=1)],
     )
-    assert graph._route_after_guard(s) == "planner"
+    guard._decide_verdict(s)
+    assert s.verdict == "replan"
     assert s.retry_count == 1
     assert s.plan is None
     assert s.tool_results == []
@@ -109,10 +141,17 @@ def test_guard_low_confidence_replans_and_resets_state():
     assert s.confidence == 0.0
 
 
-def test_guard_retry_exhaustion_blocks_with_explanation():
+def test_decide_retry_exhaustion_blocks_with_explanation():
     s = _state(confidence=0.4, retry_count=2)
-    assert graph._route_after_guard(s) == END
+    guard._decide_verdict(s)
+    assert s.verdict == "block"
     assert s.error == "low_confidence_blocked"
+
+
+def test_decide_noops_when_error_already_set():
+    s = _state(error="pii_detected", confidence=0.0)
+    guard._decide_verdict(s)
+    assert s.verdict is None  # router sends error states straight to END
 
 
 # ── _topo_levels (orchestrator DAG execution order) ──────────────────────────

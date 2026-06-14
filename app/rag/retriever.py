@@ -99,7 +99,9 @@ def _to_plan(hit: Any, similarity: float, fused_score: float) -> RetrievedPlan |
             request_text=payload.get("request_text", ""),
             plan_json=payload.get("plan_json", {}),
             summary=payload.get("summary", ""),
-            # similarity must stay in cosine space — it feeds the guardrails formula.
+            # Kept in cosine space (not the RRF fused score) so it stays a meaningful,
+            # cross-query-comparable similarity for the UI; guard.py deliberately
+            # excludes it from the confidence formula.
             similarity=max(0.0, min(1.0, similarity)),
             fused_score=fused_score,
         )

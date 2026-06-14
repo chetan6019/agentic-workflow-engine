@@ -5,6 +5,7 @@ from __future__ import annotations
 import structlog
 from fastapi import APIRouter
 from fastapi.responses import JSONResponse
+from sqlalchemy import text
 
 from app.data.db import get_engine
 from app.data.redis_client import get_redis
@@ -27,7 +28,7 @@ async def readyz() -> JSONResponse:
 
     try:
         async with get_engine().connect() as conn:
-            await conn.execute(__import__("sqlalchemy", fromlist=["text"]).text("SELECT 1"))
+            await conn.execute(text("SELECT 1"))
     except Exception as exc:
         errors.append(f"postgres: {exc}")
         log.error("readyz_postgres_fail", error=str(exc))

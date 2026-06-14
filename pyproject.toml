@@ -4,7 +4,46 @@ version = "0.1.0"
 description = "AI Workflow Automation Engine — LangGraph + LiteLLM + Qdrant + MCP"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = []
+dependencies = [
+    # Web / API
+    "fastapi",
+    "uvicorn[standard]",
+    "streamlit",
+    "httpx",
+    "pydantic",
+    "pydantic-settings",
+    # LLM / orchestration
+    "langchain",
+    "langgraph",
+    "langchain-openai",
+    "langchain-mcp-adapters",
+    # MCP servers
+    "fastmcp",
+    # Data stores
+    "sqlalchemy[asyncio]",
+    "asyncpg",
+    "redis",
+    "qdrant-client",
+    "fastembed",
+    # Schema migrations
+    "alembic",
+    # Security
+    "bcrypt",
+    "cryptography",
+    "python-jose[cryptography]",
+    # Observability
+    "structlog",
+    "langfuse",
+    # Utilities
+    "tenacity",
+    "tzdata",
+]
+
+[project.optional-dependencies]
+# Local, in-process embeddings (EMBEDDING_PROVIDER=hf). Pulls in torch (~2-3GB);
+# the default 'openai' provider routes through LiteLLM and needs neither.
+hf = ["langchain-huggingface", "sentence-transformers"]
+dev = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"

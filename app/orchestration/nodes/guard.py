@@ -22,6 +22,10 @@ log = structlog.get_logger(__name__)
 # with the guardrails node, so the scoring and routing bands share one definition.
 _HIGH_CONFIDENCE = 0.85
 _LOW_CONFIDENCE = 0.55
+# Max planner re-plans before a low-confidence run is blocked. Lives here, with the
+# bands, because guardrails_node now owns the verdict decision (the graph router only
+# reads state.verdict). Imported by the graph for the routing map.
+_MAX_RETRIES = 2
 # When True, the medium-confidence band (0.55–0.85) pauses for HITL approval instead
 # of auto-finalizing. Disabled: confidence is computed AFTER the tools run, so a medium
 # score on a successful write would ask the user to approve an action that already
@@ -47,13 +51,23 @@ _PII_PATTERNS = [
 
 
 def _contains_pii(text: str) -> bool:
-    """Return True if any PII regex matches the draft markdown."""
+    """Return True if any PII regex matches the given text."""
     return any(p.search(text) for p in _PII_PATTERNS)
+
+
+def _draft_has_pii(draft: DraftResponse) -> bool:
+    """Scan every user-facing draft field for PII, not just the markdown body.
+
+    A leaked SSN/card number in the summary or an action line is just as exposed as
+    one in the detail body, so all text fields are checked (REVIEW.md R34).
+    """
+    fields = [draft.summary, draft.detail_markdown, *draft.actions_taken, *draft.actions_pending]
+    return any(_contains_pii(t) for t in fields)
 
 
 async def _stage_one(state: AgentState) -> bool:
     """Run deterministic checks. Returns True if the LLM judge should run next."""
-    if state.draft and _contains_pii(state.draft.detail_markdown):
+    if state.draft and _draft_has_pii(state.draft):
         log.warning("guard_blocked_pii", trace_id=state.trace_id)
         state.error = "pii_detected"
         state.confidence = 0.0
@@ -117,6 +131,8 @@ async def _judge(state: AgentState) -> GuardVerdict:
         return await llm.ainvoke(messages)
     except _SCHEMA_ERRORS as exc:
         log.warning("guard_judge_fallback_neutral", error=str(exc))
+        if "guard_judge_neutral_fallback" not in state.degraded:
+            state.degraded.append("guard_judge_neutral_fallback")
         return GuardVerdict(tone_fit=0.5, hallucination_risk=0.5, instruction_adherence=0.5)
 
 
@@ -159,8 +175,41 @@ async def _mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> G
     return new_verdict
 
 
+def _decide_verdict(state: AgentState) -> None:
+    """Translate the computed confidence into an explicit verdict + its state changes.
+
+    Pure (no I/O): this is the ONE place the guardrails routing bands live, so the
+    graph router can stay a pure reader of ``state.verdict`` (REVIEW.md R6). The bands
+    match CLAUDE.md: >=0.85 finalize; 0.55-0.85 finalize (or HITL when enabled);
+    <0.55 re-plan until retries exhausted, then block. ``verdict`` is left None on the
+    error short-circuit so the router falls straight through to END.
+    """
+    if state.error:
+        return
+    conf = state.confidence
+    if conf >= _LOW_CONFIDENCE:
+        if _HITL_ENABLED and conf < _HIGH_CONFIDENCE:
+            state.verdict = "hitl"
+            state.requires_approval = True
+        else:
+            state.verdict = "finalize"
+            state.phase = "finalize"
+    elif state.retry_count < _MAX_RETRIES:
+        # Reset for a fresh plan. verdict stays "replan" so the router goes to the
+        # planner, which clears it again before the next execute → guard pass.
+        state.verdict = "replan"
+        state.retry_count += 1
+        state.plan = None
+        state.tool_results = []
+        state.draft = None
+        state.confidence = 0.0
+    else:
+        state.verdict = "block"
+        state.error = "low_confidence_blocked"
+
+
 async def guardrails_node(state: AgentState) -> AgentState:
-    """Score the draft, set confidence + requires_approval, and return updated state."""
+    """Score the draft, set confidence + verdict, and return updated state."""
     t0 = time.monotonic()
     log.info("guardrails_node_start", trace_id=state.trace_id)
     should_continue = await _stage_one(state)
@@ -176,16 +225,15 @@ async def guardrails_node(state: AgentState) -> AgentState:
         verdict = await _mitigate_hallucination(state, verdict)
 
     state.confidence = _compute_confidence(state, verdict)
-    # Medium-confidence band pauses for HITL. Mint the approval token now so the sync
-    # graph router can simply route to END and the UI has a valid token to act on.
-    if (_HITL_ENABLED and _LOW_CONFIDENCE <= state.confidence < _HIGH_CONFIDENCE
-            and not state.approval_token):
-        state.requires_approval = True
+    _decide_verdict(state)
+    # HITL band: mint the approval token now so the router can simply route to END and
+    # the UI has a valid token to act on. (Inert while _HITL_ENABLED is False.)
+    if state.verdict == "hitl" and not state.approval_token:
         state.approval_token = await create_approval(state.trace_id)
         await save_plan(state)
         log.info("guard_awaiting_approval", trace_id=state.trace_id,
                  confidence=round(state.confidence, 3))
     log.info("guardrails_node_done", confidence=round(state.confidence, 3),
-             requires_approval=state.requires_approval,
+             verdict=state.verdict, requires_approval=state.requires_approval,
              duration_ms=int((time.monotonic() - t0) * 1000))
     return state

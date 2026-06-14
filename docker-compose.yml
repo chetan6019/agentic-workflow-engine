@@ -39,6 +39,11 @@ services:
     image: qdrant/qdrant:latest
     ports: ["6333:6333"]
     volumes: ["qdrantdata:/qdrant/storage"]
+    restart: unless-stopped
+    # No container healthcheck: the qdrant image ships neither curl/wget nor a
+    # health subcommand, so any in-container probe would be unreliable (a broken
+    # healthcheck pinning the service "unhealthy" is worse than none). The app
+    # tolerates a not-yet-ready qdrant — retrieval failures are best-effort.
 
   tei:
     image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
@@ -75,6 +80,13 @@ services:
     command: ["python", "-m", "app.mcp.servers.calendar_server"]
     ports: ["7001:7001"]
     env_file: .env
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7001)))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on: [postgres, redis]
 
   mcp-gmail:
@@ -83,6 +95,13 @@ services:
     command: ["python", "-m", "app.mcp.servers.gmail_server"]
     ports: ["7002:7002"]
     env_file: .env
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7002)))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on: [postgres, redis]
 
   mcp-notion:
@@ -91,6 +110,13 @@ services:
     command: ["python", "-m", "app.mcp.servers.notion_server"]
     ports: ["7003:7003"]
     env_file: .env
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7003)))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on: [postgres, redis]
 
   mcp-slack:
@@ -99,6 +125,13 @@ services:
     command: ["python", "-m", "app.mcp.servers.slack_server"]
     ports: ["7004:7004"]
     env_file: .env
+    restart: on-failure
+    healthcheck:
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7004)))"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
     depends_on: [postgres, redis]
 
   api:
