@@ -17,17 +17,17 @@ model_list:
       api_key: os.environ/GROQ_API_KEY
       timeout: 30
 
-  # ---- Retriever grader ----
+  # ---- Retriever grader (low-stakes: scoring/routing → cheaper 20b) ----
   - model_name: retriever-grader
     litellm_params:
-      model: groq/openai/gpt-oss-120b
+      model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
 
-  # ---- Guardrails judge ----
+  # ---- Guardrails judge (low-stakes: scoring → cheaper 20b) ----
   - model_name: guard-judge
     litellm_params:
-      model: groq/openai/gpt-oss-120b
+      model: groq/openai/gpt-oss-20b
       api_key: os.environ/GROQ_API_KEY
       timeout: 20
 
