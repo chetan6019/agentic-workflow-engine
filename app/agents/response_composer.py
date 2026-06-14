@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from json import JSONDecodeError
 
 import structlog
@@ -78,9 +79,8 @@ def _inject_failures(draft: DraftResponse, state: AgentState) -> DraftResponse:
 
 
 async def _compose_direct_answer(state: AgentState, preferences: list[str],
-                                 judge_feedback: str | None = None) -> DraftResponse:
+                                 tool_specs: list, judge_feedback: str | None = None) -> DraftResponse:
     """Answer a meta/conversational request directly when no tools were involved."""
-    tool_specs = await fetch_tool_specs(state.user_request, _TOOL_DOC_K)
     messages = build_direct_answer_messages(
         user_request=state.user_request,
         tool_specs=tool_specs,
@@ -121,11 +121,15 @@ async def compose(state: AgentState, judge_feedback: str | None = None) -> Draft
     note instructing the model to ground every claim in the tool results.
     """
     structlog.contextvars.bind_contextvars(trace_id=state.trace_id, user_id=state.user_id)
-    preferences = await _fetch_preferences(state)
 
     no_steps = state.plan is None or not state.plan.steps
     if no_steps and not state.tool_results:
-        return await _compose_direct_answer(state, preferences, judge_feedback)
+        # Direct answer: preferences and the tool catalog are independent fetches.
+        preferences, tool_specs = await asyncio.gather(
+            _fetch_preferences(state), fetch_tool_specs(state.user_request, _TOOL_DOC_K))
+        return await _compose_direct_answer(state, preferences, tool_specs, judge_feedback)
+
+    preferences = await _fetch_preferences(state)
 
     messages = build_composer_messages(
         plan=state.plan,

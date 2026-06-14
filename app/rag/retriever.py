@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from typing import Any
 
@@ -142,38 +143,39 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     sparse = await embed_sparse(query)
     t1 = time.monotonic()
     client = get_qdrant()
-    # TODO(REVIEW.md R27): the fused and dense passes are independent and can be
-    # asyncio.gather'd now that the client is async.
-    fused = (await client.query_points(
-        collection_name=_PLANS_COLLECTION,
-        prefetch=[
-            Prefetch(query=vec, using=DENSE_VECTOR, filter=qfilter, limit=k),
-            Prefetch(query=sparse, using=SPARSE_VECTOR, filter=qfilter, limit=k),
-        ],
-        query=FusionQuery(fusion=Fusion.RRF),
-        limit=k,
-    )).points
+    # The RRF-fused pass and the cosine-recovery dense pass are independent, so
+    # run them concurrently — one Qdrant round-trip of latency instead of two.
+    # (RRF drops per-vector scores, hence the separate dense pass for cosine.)
+    fused_resp, dense_resp = await asyncio.gather(
+        client.query_points(
+            collection_name=_PLANS_COLLECTION,
+            prefetch=[
+                Prefetch(query=vec, using=DENSE_VECTOR, filter=qfilter, limit=k),
+                Prefetch(query=sparse, using=SPARSE_VECTOR, filter=qfilter, limit=k),
+            ],
+            query=FusionQuery(fusion=Fusion.RRF),
+            limit=k,
+        ),
+        client.query_points(
+            collection_name=_PLANS_COLLECTION,
+            query=vec,
+            using=DENSE_VECTOR,
+            query_filter=qfilter,
+            limit=k,
+        ),
+    )
     t2 = time.monotonic()
-    # RRF drops per-vector scores, so run one dense pass to recover cosine per hit.
-    dense = (await client.query_points(
-        collection_name=_PLANS_COLLECTION,
-        query=vec,
-        using=DENSE_VECTOR,
-        query_filter=qfilter,
-        limit=k,
-    )).points
-    t3 = time.monotonic()
-    cosine = {str(getattr(h, "id", "")): float(getattr(h, "score", 0.0)) for h in dense}
+    cosine = {str(getattr(h, "id", "")): float(getattr(h, "score", 0.0))
+              for h in dense_resp.points}
     plans: list[RetrievedPlan] = []
-    for hit in fused:
+    for hit in fused_resp.points:
         hid = str(getattr(hit, "id", ""))
         plan = _to_plan(hit, cosine.get(hid, 0.0), float(getattr(hit, "score", 0.0)))
         if plan is not None:
             plans.append(plan)
     log.info("search_timing", mode="hybrid",
-             sparse_ms=int((t1 - t0) * 1000), fused_ms=int((t2 - t1) * 1000),
-             dense_ms=int((t3 - t2) * 1000), total_ms=int((t3 - t0) * 1000),
-             hits=len(plans))
+             sparse_ms=int((t1 - t0) * 1000), query_ms=int((t2 - t1) * 1000),
+             total_ms=int((t2 - t0) * 1000), hits=len(plans))
     return plans
 
 
