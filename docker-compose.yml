@@ -69,6 +69,12 @@ services:
       # Own database — LiteLLM's Prisma sync drops unknown tables, so it MUST NOT
       # share the app's `workflow` DB (that wiped users/sessions on every restart).
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/litellm
+      # Isolate ALL of LiteLLM's Redis usage (response cache, router state) in db 1,
+      # away from the app's db 0. This override is REQUIRED: LiteLLM reads REDIS_URL
+      # from the env (.env sets db 0) in preference to cache_params, so without it the
+      # proxy cache co-mingles with the app's keys in db 0. `environment` wins over
+      # `env_file`, so this overrides the .env value for the proxy only.
+      REDIS_URL: redis://redis:6379/1
       # DEBUG dumps full request/response blobs on every call — keep INFO unless
       # actively debugging LiteLLM internals.
       LITELLM_LOG: INFO

@@ -45,6 +45,15 @@ dependencies = [
 hf = ["langchain-huggingface", "sentence-transformers"]
 dev = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
 
+[tool.mypy]
+# The package has no __init__.py files (namespace-style layout), so without
+# these mypy maps app/mcp/client.py and app/llm/client.py to the same bare
+# "client" module and bails. Deriving package bases from the repo root makes
+# them app.mcp.client and app.llm.client instead.
+explicit_package_bases = true
+namespace_packages = true
+mypy_path = "."
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]

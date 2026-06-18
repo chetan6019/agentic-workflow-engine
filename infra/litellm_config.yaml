@@ -67,15 +67,16 @@ litellm_settings:
   # Response caching. Same pitfall as callbacks above: this must live under
   # litellm_settings as cache/cache_params — a top-level `cache:` key is
   # silently ignored by the proxy. One flat TTL: per-model TTL maps are not
-  # a supported shape. db 1 keeps proxy entries out of the app's Redis db 0.
+  # a supported shape. The Redis connection (and thus the db) comes from the
+  # REDIS_URL env, which LiteLLM honors in preference to cache_params here — it
+  # is pinned to db 1 in docker-compose.yml (litellm-proxy.environment) to keep
+  # proxy entries out of the app's db 0. Do NOT rely on a `db:` cache_param: this
+  # build ignores it and writes to whatever db REDIS_URL names.
   # Chat completions only — embeddings already have a 24h app-side cache in
   # app/rag/embedder.py, so proxy-caching them would just duplicate entries.
   cache: true
   cache_params:
     type: redis
-    host: redis
-    port: 6379
-    db: 1
     ttl: 600
     supported_call_types: ["completion", "acompletion"]
 
