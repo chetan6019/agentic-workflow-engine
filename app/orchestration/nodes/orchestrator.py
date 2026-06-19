@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.core.background import spawn
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
+from app.guardrails import evaluate_input
 from app.mcp.client import get_mcp_client
 from app.rag.indexer import index_plan
 from app.rag.retriever import retrieve
@@ -159,7 +160,23 @@ async def _execute_level(level: list[PlanStep], mcp, parallel: bool,
 
 
 async def _run_entry(state: AgentState) -> AgentState:
-    """Load session context and seed retrieved plans."""
+    """Run input guardrails, load session context, and seed retrieved plans.
+
+    Input guardrails run FIRST, before any retrieval or planning, so the planner
+    only ever sees a vetted (and PII-redacted) request. A block/rate-limit short-
+    circuits the run via the error path; a redaction rewrites ``user_request``.
+    """
+    decision = await evaluate_input(state.user_request, user_id=state.user_id,
+                                    trace_id=state.trace_id)
+    if not decision.allowed:
+        state.error = f"guardrail_input:{','.join(decision.blocked_rules)}"
+        log.warning("input_guardrail_blocked", rules=decision.blocked_rules)
+        return state
+    if any(h.action == "rate_limit" for h in decision.hits):
+        state.error = "rate_limited"
+        log.warning("input_guardrail_rate_limited", trace_id=state.trace_id)
+        return state
+    state.user_request = decision.text  # planner sees the redacted prompt
     await get_session(state.session_id)
     state.retrieved_plans = await retrieve(state)
     log.info("orchestrator_entry_done", retrieved=len(state.retrieved_plans))

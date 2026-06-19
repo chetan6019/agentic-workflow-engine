@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 
 from app.data.db import get_engine
@@ -19,6 +20,12 @@ router = APIRouter()
 async def healthz() -> dict:
     """Liveness probe — always returns 200 if the process is running."""
     return {"status": "ok"}
+
+
+@router.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus scrape endpoint exposing the default registry (guardrail counters)."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
 
 
 @router.get("/readyz")

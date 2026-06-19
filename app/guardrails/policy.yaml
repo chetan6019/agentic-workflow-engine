@@ -1,0 +1,29 @@
+# Guardrail policy — allowlist/denylist consulted by the output pipeline.
+# Pure data: no code. Edited freely; loaded + cached by app/guardrails/engine.py.
+
+# (tool, action) pairs that are hard-blocked even if the planner produces them.
+denied_tool_actions: []
+  # - { tool: gmail, action: delete_forever }
+
+# Actions that ALWAYS require human approval before they run (destructive deletes).
+approval_required_actions:
+  - calendar.delete_event
+  - slack.delete_message
+
+# Sending mail is approval-gated only when the recipient domain is NOT allowlisted.
+email_send_action: gmail.send_email
+recipient_allowlist:
+  - example.com
+  - acme.test
+
+# Small, configurable unsafe-content denylist; matches are redacted from responses.
+profanity:
+  - crap
+  - darn
+
+# Throttle: max successful outbound emails per user per hour before output is blocked.
+max_emails_per_hour: 5
+
+# Input rate caps (Redis counters), per user.
+rate_per_minute: 30
+rate_per_hour: 300

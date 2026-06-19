@@ -21,8 +21,8 @@ from app.security.jwt_tokens import decode_access_token
 
 log = structlog.get_logger(__name__)
 
-# Liveness/readiness probes are never rate limited or auth-checked.
-_PROBES = {"/healthz", "/readyz"}
+# Liveness/readiness/metrics endpoints are never rate limited or auth-checked.
+_PROBES = {"/healthz", "/readyz", "/metrics"}
 # Paths that don't require a decoded JWT (auth bootstrap + token-based approvals).
 _NO_JWT = _PROBES | {"/v1/auth/register", "/v1/auth/login"}
 # Seconds to let in-flight background runs finish on SIGTERM before cancelling.

@@ -14,6 +14,7 @@ from app.core.state import AgentState, ToolResult
 from app.data.db import get_async_session
 from app.data.models import (
     Approval,
+    AuditLog,
     Feedback,
     IntegrationToken,
     Message,
@@ -80,8 +81,10 @@ async def rename_session(session_id: str, user_id: str, title: str) -> bool:
         result = await s.execute(
             update(Session).where(Session.id == session_id, Session.user_id == user_id).values(title=title)
         )
-        log.info("session_renamed", session_id=session_id, ok=result.rowcount > 0)
-        return result.rowcount > 0
+        rowcount: int = getattr(result, "rowcount", 0) or 0
+        renamed = rowcount > 0
+        log.info("session_renamed", session_id=session_id, ok=renamed)
+        return renamed
 
 
 async def save_message(session_id: str, role: str, content: str) -> None:
@@ -183,6 +186,13 @@ async def save_feedback(trace_id: str, score: int, comment: str | None = None) -
     async with get_async_session() as s:
         s.add(Feedback(trace_id=trace_id, score=score, comment=comment))
         log.info("feedback_saved", trace_id=trace_id, score=score)
+
+
+async def save_audit(user_id: str, action: str, detail: str | None = None) -> None:
+    """Append an immutable audit-trail entry (used by guardrail blocks)."""
+    async with get_async_session() as s:
+        s.add(AuditLog(user_id=user_id, action=action, detail=detail))
+        log.info("audit_logged", user_id=user_id, action=action)
 
 
 async def save_token(user_id: str, provider: str, token_enc: str) -> None:

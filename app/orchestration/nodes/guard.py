@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from json import JSONDecodeError
 from statistics import mean
@@ -14,8 +13,10 @@ from pydantic import ValidationError
 from app.agents.response_composer import compose
 from app.core.state import AgentState, DraftResponse, GuardVerdict
 from app.data.repositories import create_approval, get_token, save_plan
+from app.guardrails import evaluate_output
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_guard_judge_messages
+from app.security.redaction import contains_pii
 
 log = structlog.get_logger(__name__)
 # Guardrails confidence thresholds (also imported by the graph router). Kept here,
@@ -42,27 +43,17 @@ _HALLUCINATION_RISK_LIMIT = 0.7
 _SCHEMA_ERRORS = (ValidationError, JSONDecodeError, OutputParserException)
 
 # Email addresses are intentionally NOT treated as blocking PII: this is an email
-# assistant, so sender/recipient addresses are inherent to legitimate output.
-# Only genuinely sensitive, low-false-positive patterns block the draft.
-_PII_PATTERNS = [
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # US SSN
-    re.compile(r"\b(?:\d{4}[ -]?){3}\d{4}\b"),  # 16-digit credit-card number
-]
-
-
-def _contains_pii(text: str) -> bool:
-    """Return True if any PII regex matches the given text."""
-    return any(p.search(text) for p in _PII_PATTERNS)
-
-
+# assistant, so sender/recipient addresses are inherent to legitimate output. Only
+# genuinely sensitive patterns (SSN, Luhn-valid card) block the draft — the shared
+# detector in app/security/redaction.py encodes that same narrow set.
 def _draft_has_pii(draft: DraftResponse) -> bool:
-    """Scan every user-facing draft field for PII, not just the markdown body.
+    """Scan every user-facing draft field for sensitive PII, not just the body.
 
     A leaked SSN/card number in the summary or an action line is just as exposed as
     one in the detail body, so all text fields are checked (REVIEW.md R34).
     """
     fields = [draft.summary, draft.detail_markdown, *draft.actions_taken, *draft.actions_pending]
-    return any(_contains_pii(t) for t in fields)
+    return any(contains_pii(t) for t in fields)
 
 
 async def _stage_one(state: AgentState) -> bool:
@@ -208,6 +199,36 @@ def _decide_verdict(state: AgentState) -> None:
         state.error = "low_confidence_blocked"
 
 
+async def _run_output_guardrails(state: AgentState) -> bool:
+    """Apply OUTPUT guardrails to the final draft before it can finalize/stream.
+
+    Returns True to continue scoring; False to short-circuit (a block sets
+    ``error``; a flag routes through the existing HITL approval path). Redactions
+    and truncation are written back onto the streamed body.
+    """
+    if state.draft is None:
+        return True
+    decision = await evaluate_output(
+        state.draft.detail_markdown,
+        draft=state.draft, plan=state.plan, retrieved_plans=state.retrieved_plans,
+        user_id=state.user_id, trace_id=state.trace_id, source_was_user=False,
+    )
+    if decision.text != state.draft.detail_markdown:
+        state.draft.detail_markdown = decision.text
+    if not decision.allowed:
+        state.error = f"guardrail_output:{','.join(decision.blocked_rules)}"
+        log.warning("output_guardrail_blocked", rules=decision.blocked_rules)
+        return False
+    if decision.requires_approval and not state.approval_token:
+        state.requires_approval = True
+        state.approval_token = await create_approval(state.trace_id)
+        await save_plan(state)  # persist token + redacted draft so resume finds them
+        log.info("output_guardrail_awaiting_approval", trace_id=state.trace_id,
+                 rules=[h.rule for h in decision.hits if h.action == "flag_for_approval"])
+        return False
+    return True
+
+
 async def guardrails_node(state: AgentState) -> AgentState:
     """Score the draft, set confidence + verdict, and return updated state."""
     t0 = time.monotonic()
@@ -223,6 +244,12 @@ async def guardrails_node(state: AgentState) -> AgentState:
     # verdict (re-judged when mitigated) is what feeds the confidence score.
     if verdict.hallucination_risk > _HALLUCINATION_RISK_LIMIT:
         verdict = await _mitigate_hallucination(state, verdict)
+
+    # Output guardrails gate the draft (redact/flag/block) before it can finalize.
+    if not await _run_output_guardrails(state):
+        log.info("guardrails_node_output_gate", error=state.error,
+                 requires_approval=state.requires_approval)
+        return state
 
     state.confidence = _compute_confidence(state, verdict)
     _decide_verdict(state)
