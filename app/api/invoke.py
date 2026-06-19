@@ -15,6 +15,7 @@ from app.config import get_settings
 from app.core.background import spawn
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
+from app.guardrails import evaluate_input
 from app.data.repositories import (
     create_session,
     get_plan_by_trace_id,
@@ -59,6 +60,10 @@ _PHASE_KEY = "phase:{trace_id}"
 _PHASE_TTL = 600
 # Prior conversation turns fed to the planner for follow-up resolution.
 _HISTORY_TURNS = 6
+# Idempotency-Key → trace_id mapping TTL (replays within this window return the
+# original run instead of starting a duplicate).
+_IDEM_KEY = "idem:{user_id}:{key}"
+_IDEM_TTL = 86_400
 
 
 def _phase_label(state: AgentState) -> str:
@@ -141,13 +146,33 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
 
 @router.post("/invoke", response_model=InvokeResponse)
 async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
-    """Kick off the workflow in the background; UI polls /phase and /result."""
+    """Kick off the workflow in the background; UI polls /phase and /result.
+
+    Input guardrails run synchronously here (the API boundary): a blocked request
+    fails fast with 400, a rate-cap hit with 429, and PII is redacted before the
+    planner ever sees it. An ``Idempotency-Key`` header replays the original run.
+    """
     user_id = getattr(request.state, "user_id", None)
     if not user_id:
         raise HTTPException(status_code=401, detail="unauthenticated")
 
-    session_id = str(req.session_id or await create_session(user_id))
+    idem_key = request.headers.get("Idempotency-Key")
+    if idem_key:
+        cached = await get_redis().get(_IDEM_KEY.format(user_id=user_id, key=idem_key))
+        if cached:
+            cached_trace = cached.decode() if isinstance(cached, (bytes, bytearray)) else cached
+            log.info("invoke_idempotent_replay", trace_id=cached_trace, user_id=user_id)
+            return InvokeResponse(trace_id=cached_trace)
+
     trace_id = uuid4().hex
+    decision = await evaluate_input(req.user_request, user_id=user_id, trace_id=trace_id)
+    if not decision.allowed:
+        raise HTTPException(status_code=400, detail=f"input_guardrail:{','.join(decision.blocked_rules)}")
+    if any(h.action == "rate_limit" for h in decision.hits):
+        raise HTTPException(status_code=429, detail="rate_limited")
+    vetted_request = decision.text  # PII-redacted prompt the planner will see
+
+    session_id = str(req.session_id or await create_session(user_id))
     log.info("invoke_accepted", trace_id=trace_id, user_id=user_id,
              session_id=session_id, new_session=req.session_id is None)
 
@@ -156,7 +181,7 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
     # must not block the run.
     try:
         history = await get_recent_messages(session_id, _HISTORY_TURNS)
-        await save_message(session_id, "user", req.user_request)
+        await save_message(session_id, "user", vetted_request)
     except Exception as exc:
         log.warning("history_load_failed", trace_id=trace_id, error=str(exc))
         history = []
@@ -165,12 +190,14 @@ async def invoke(req: InvokeRequest, request: Request) -> InvokeResponse:
         trace_id=trace_id,
         user_id=user_id,
         session_id=session_id,
-        user_request=req.user_request,
+        user_request=vetted_request,
         history=history,
         requires_approval=req.require_approval,
     )
     await _set_phase(trace_id, "🚀 starting", user_id)
     spawn(_run_workflow_with_phase(initial))
+    if idem_key:
+        await get_redis().set(_IDEM_KEY.format(user_id=user_id, key=idem_key), trace_id, ex=_IDEM_TTL)
     return InvokeResponse(trace_id=trace_id)
 
 

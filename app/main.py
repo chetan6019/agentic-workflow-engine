@@ -54,7 +54,9 @@ async def _shutdown() -> None:
 async def _auth_and_rate_limit(request: Request, call_next) -> Response:
     """Decode the bearer token onto request.state, then enforce a per-identity rate limit."""
     path = request.url.path
-    if path not in _NO_JWT and not path.startswith("/v1/approvals"):
+    # Approvals decode the JWT when present (so list + ownership checks work) but do
+    # not require it — the {token} capability still authorizes the POST on its own.
+    if path not in _NO_JWT:
         auth_header = request.headers.get("Authorization", "")
         token = auth_header.removeprefix("Bearer ") if auth_header.startswith("Bearer ") else ""
         request.state.user_id = decode_access_token(token) if token else None

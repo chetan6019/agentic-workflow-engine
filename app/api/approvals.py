@@ -6,12 +6,13 @@ from datetime import datetime, timezone
 from typing import Literal
 
 import structlog
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.core.state import AgentState, DraftResponse
 from app.data.repositories import (
     get_approval_by_token,
+    get_pending_approvals_by_user,
     get_plan_by_trace_id,
     save_plan,
     update_approval_status,
@@ -76,8 +77,27 @@ def _is_expired(expires_at) -> bool:
     return expires_at < datetime.now(timezone.utc)
 
 
+@router.get("/approvals")
+async def list_approvals(request: Request, status: str = "pending") -> dict:
+    """List the caller's pending approvals; expired ones auto-reject on read."""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+    if status != "pending":
+        raise HTTPException(status_code=400, detail="unsupported_status")
+    pending: list[dict] = []
+    for row in await get_pending_approvals_by_user(user_id):
+        if _is_expired(row.get("expires_at")):
+            await update_approval_status(row["token"], "rejected")  # auto-reject stale
+            log.info("approval_auto_rejected", trace_id=row.get("trace_id"))
+            continue
+        pending.append({"token": row["token"], "trace_id": row["trace_id"],
+                        "expires_at": str(row["expires_at"])})
+    return {"approvals": pending}
+
+
 @router.post("/approvals/{token}", response_model=ApprovalResponse)
-async def submit_approval(token: str, req: ApprovalRequest) -> ApprovalResponse:
+async def submit_approval(token: str, req: ApprovalRequest, request: Request) -> ApprovalResponse:
     """Apply the user's decision to the paused workflow and resume the graph."""
     log.info("approval_received", token=token[:8] + "…", decision=req.decision)
     approval = await get_approval_by_token(token)
@@ -92,6 +112,15 @@ async def submit_approval(token: str, req: ApprovalRequest) -> ApprovalResponse:
     if not plan_row:
         log.warning("approval_plan_not_found", trace_id=approval.get("trace_id"))
         raise HTTPException(status_code=404, detail="plan_not_found")
+
+    # Ownership (security fix): a JWT-authenticated caller may only act on their own
+    # run. The {token} capability still authorizes anonymous (email-link) use, so the
+    # check only fires when a caller identity is present and differs from the owner.
+    caller = getattr(request.state, "user_id", None)
+    owner = plan_row.get("user_id")
+    if caller is not None and owner is not None and caller != owner:
+        log.warning("approval_cross_user_denied", trace_id=approval.get("trace_id"))
+        raise HTTPException(status_code=403, detail="forbidden")
 
     # state_json is stored as a JSON string (model_dump_json), so parse, don't model_validate.
     state = AgentState.model_validate_json(plan_row["state_json"])
