@@ -46,6 +46,10 @@ dependencies = [
 # the default 'openai' provider routes through LiteLLM and needs neither.
 hf = ["langchain-huggingface", "sentence-transformers"]
 dev = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
+eval = [
+    "datasets>=5.0.0",
+    "ragas>=0.4.3",
+]
 
 [tool.mypy]
 # The package has no __init__.py files (namespace-style layout), so without
