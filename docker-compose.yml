@@ -45,22 +45,22 @@ services:
     # healthcheck pinning the service "unhealthy" is worse than none). The app
     # tolerates a not-yet-ready qdrant — retrieval failures are best-effort.
 
-  tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
-    command: ["--model-id", "BAAI/bge-base-en-v1.5", "--port", "80"]
-    ports: ["8080:80"]
-    volumes: ["teidata:/data"]
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
+  # tei:
+  #   image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+  #   command: ["--model-id", "BAAI/bge-base-en-v1.5", "--port", "80"]
+  #   ports: ["8080:80"]
+  #   volumes: ["teidata:/data"]
+  #   environment:
+  #     HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 60s
 
   litellm-proxy:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:main-stable
     command: ["--config", "/config.yaml", "--port", "4000"]
     ports: ["4000:4000"]
     volumes: ["./infra/litellm_config.yaml:/config.yaml:ro"]
@@ -78,62 +78,126 @@ services:
       # DEBUG dumps full request/response blobs on every call — keep INFO unless
       # actively debugging LiteLLM internals.
       LITELLM_LOG: INFO
-    depends_on: [postgres, redis, tei]
+    depends_on: [postgres, redis]
 
-  mcp-calendar:
+  # STALE (2026-06-22): the four service blocks below (mcp-calendar/gmail/notion/slack) are
+  # superseded by the google/github/reddit/finnhub services further down. Commented out — not
+  # deleted — per CLAUDE.md R13. A later cleanup PR sweeps these.
+  # mcp-calendar:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.calendar_server"]
+  #   ports: ["7001:7001"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7001)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-gmail:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.gmail_server"]
+  #   ports: ["7002:7002"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7002)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-notion:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.notion_server"]
+  #   ports: ["7003:7003"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7003)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-slack:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.slack_server"]
+  #   ports: ["7004:7004"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7004)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # ── New MCP servers: google / github / reddit / finnhub ──────────────────────
+  mcp-finnhub:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.calendar_server"]
-    ports: ["7001:7001"]
+    command: ["python", "-m", "app.mcp.servers.finnhub_server"]
+    ports: ["7005:7005"]
     env_file: .env
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7001)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7005)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-gmail:
+  mcp-reddit:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.gmail_server"]
-    ports: ["7002:7002"]
+    command: ["python", "-m", "app.mcp.servers.reddit_server"]
+    ports: ["7006:7006"]
     env_file: .env
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7002)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7006)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-notion:
+  mcp-github:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.notion_server"]
-    ports: ["7003:7003"]
+    command: ["python", "-m", "app.mcp.servers.github_server"]
+    ports: ["7007:7007"]
     env_file: .env
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7003)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7007)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-slack:
+  mcp-google:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.slack_server"]
-    ports: ["7004:7004"]
+    command: ["python", "-m", "app.mcp.servers.google_server"]
+    ports: ["7008:7008"]
     env_file: .env
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7004)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7008)))"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -148,10 +212,16 @@ services:
     env_file: .env
     environment:
       # Reach the MCP servers by their Docker service names, not localhost.
-      MCP_CALENDAR_URL: http://mcp-calendar:7001
-      MCP_GMAIL_URL: http://mcp-gmail:7002
-      MCP_NOTION_URL: http://mcp-notion:7003
-      MCP_SLACK_URL: http://mcp-slack:7004
+      # STALE (2026-06-22): old MCP URLs superseded by the google/github/reddit/finnhub set
+      # below; commented (not deleted) per CLAUDE.md R13.
+      # MCP_CALENDAR_URL: http://mcp-calendar:7001
+      # MCP_GMAIL_URL: http://mcp-gmail:7002
+      # MCP_NOTION_URL: http://mcp-notion:7003
+      # MCP_SLACK_URL: http://mcp-slack:7004
+      MCP_FINNHUB_URL: http://mcp-finnhub:7005
+      MCP_REDDIT_URL: http://mcp-reddit:7006
+      MCP_GITHUB_URL: http://mcp-github:7007
+      MCP_GOOGLE_URL: http://mcp-google:7008
       TZ: ${TZ:-UTC}
     depends_on:
       postgres:
@@ -174,10 +244,12 @@ services:
     ports: ["8501:8501"]
     env_file: .env
     environment:
+      # Reach the api by its Docker service name, not localhost (which inside
+      # this container is the streamlit process itself).
+      API_BASE_URL: http://api:8000
       TZ: ${TZ:-UTC}
     depends_on: [api]
 
 volumes:
   pgdata:
   qdrantdata:
-  teidata:
