@@ -40,7 +40,7 @@ class Settings(BaseSettings):
     langfuse_secret_key: str | None = None
     # Embedding client shape. "openai" speaks the OpenAI-compatible API to the
     # LiteLLM proxy (default); "hf" runs sentence-transformers in-process.
-    embedding_provider: Literal["openai", "hf"] = "openai"
+    embedding_provider: str
     hf_embedding_model: str = "BAAI/bge-base-en-v1.5"
     # IANA zone the calendar tools ask Google to return times in (and to interpret
     # event start/end). Defaults to IST; override with DEFAULT_TZ for other regions.
@@ -55,6 +55,31 @@ class Settings(BaseSettings):
     # Hard ceiling on a single workflow run; a run exceeding it is marked
     # run_timeout instead of hanging forever. Override with RUN_TIMEOUT_SEC.
     run_timeout_sec: int = 120
+
+    # ── New MCP servers: google / github / reddit / finnhub migration ────────
+    # STALE (2026-06-22) context: the old mcp_{calendar,gmail,notion,slack}_url fields above
+    # stay required and untouched per CLAUDE.md R13. These new fields are OPTIONAL with sane
+    # defaults so the app keeps starting before .env is populated — a tool call fails only when
+    # ITS specific credential is actually missing, not at import time.
+    mcp_finnhub_url: str = "http://localhost:7005"
+    mcp_reddit_url: str = "http://localhost:7006"
+    mcp_github_url: str = "http://localhost:7007"
+    mcp_google_url: str = "http://localhost:7008"
+    # finnhub: API key only, read-only by design (no per-user OAuth token).
+    finnhub_api_key: str | None = None
+    # github: per-user OAuth token is stored via the integrations flow; these are the app creds.
+    github_oauth_client_id: str | None = None
+    github_oauth_client_secret: str | None = None
+    # reddit: "script app" OAuth. client_id/secret drive app-only reads; username/password are
+    # only needed for the HITL-gated write tools (post_comment / submit).
+    reddit_client_id: str | None = None
+    reddit_client_secret: str | None = None
+    reddit_username: str | None = None
+    reddit_password: str | None = None
+    # google (Gmail + Calendar on one token). Falls back to gmail_client_id/secret above when
+    # unset, so existing .env files keep working.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: str | None = None
 
 
 @lru_cache(maxsize=1)
