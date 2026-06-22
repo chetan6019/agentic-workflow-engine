@@ -24,7 +24,8 @@ from app.data.repositories import save_audit
 from app.guardrails.contracts import Decision, RuleHit, decide
 from app.guardrails.input_rules import (
     check_jailbreak,
-    check_language,
+    # STALE (2026-06-22): check_language retired (low-value signal); no longer imported.
+    # check_language,
     check_oversized,
     check_pii,
     check_prompt_injection,
@@ -36,8 +37,11 @@ from app.guardrails.output_rules import (
     check_length,
     check_pii_leak,
     check_policy_tool_args,
-    check_profanity,
+    check_tool_args,
+    # STALE (2026-06-22): check_profanity retired (subjective, low value); no longer imported.
+    # check_profanity,
     check_secret_leak,
+    is_trusted_read,
 )
 
 log = structlog.get_logger(__name__)
@@ -55,6 +59,11 @@ class _Policy(NamedTuple):
     max_emails_per_hour: int
     rate_per_minute: int
     rate_per_hour: int
+    # Tool-specific config consumed by output_rules.check_tool_args + the trusted-read carve-out.
+    google_event_cfg: dict[str, object]
+    github_body_cfg: dict[str, object]
+    finnhub_cfg: dict[str, object]
+    trusted_read_actions: set[str]
 
 
 @lru_cache(maxsize=1)
@@ -71,6 +80,10 @@ def _policy() -> _Policy:
         max_emails_per_hour=int(raw.get("max_emails_per_hour", 5)),
         rate_per_minute=int(raw.get("rate_per_minute", 30)),
         rate_per_hour=int(raw.get("rate_per_hour", 300)),
+        google_event_cfg=dict(raw.get("google_create_event") or {}),
+        github_body_cfg=dict(raw.get("github_write_body") or {}),
+        finnhub_cfg=dict(raw.get("finnhub") or {}),
+        trusted_read_actions=set(raw.get("trusted_read_actions") or []),
     )
 
 
@@ -166,8 +179,9 @@ def _emit(decision: Decision, trace_id: str) -> None:
 async def evaluate_input(text: str, *, user_id: str, trace_id: str) -> Decision:
     """Run the INPUT pipeline over a user request; returns a folded Decision."""
     hits: list[RuleHit] = []
+    # STALE (2026-06-22): check_language removed from this tuple (retired, low-value signal).
     for check in (check_prompt_injection, check_jailbreak, check_secrets,
-                  check_oversized, check_language):
+                  check_oversized):  # was: ..., check_oversized, check_language
         hit = check(text)
         if hit is not None:
             hits.append(hit)
@@ -189,26 +203,53 @@ async def evaluate_output(text: str, *, draft: DraftResponse | None,
     pol = _policy()
     hits: list[RuleHit] = []
 
-    secret = check_secret_leak(text)
-    if secret is not None:
-        hits.append(secret)
-        await _audit_secret_leak(user_id, trace_id)
+    # Trusted-read carve-out (CLAUDE.md rule #6): when the plan is non-empty and EVERY step is a
+    # trusted read (the user's own github repos, or finnhub's structured JSON), skip the three
+    # response content scans below — secret leak, PII leak, hallucination citation. The source is
+    # trusted by definition, so scanning every response costs more than the threat. Per-user auth
+    # and the Redis rate caps still run for every step; only these scans are skipped.
+    trusted = plan is not None and bool(plan.steps) and all(
+        is_trusted_read(step, pol.trusted_read_actions) for step in plan.steps)
+    if trusted and plan is not None:
+        log.info("guardrail_trusted_read_skip", trace_id=trace_id,
+                 steps=[f"{s.tool}.{s.action}" for s in plan.steps])
 
-    text, pii = check_pii_leak(text, source_was_user=source_was_user)
-    if pii is not None:
-        hits.append(pii)
-    text, profanity = check_profanity(text, pol.profanity)
-    if profanity is not None:
-        hits.append(profanity)
+    if not trusted:
+        secret = check_secret_leak(text)
+        if secret is not None:
+            hits.append(secret)
+            await _audit_secret_leak(user_id, trace_id)
 
+        # PII gates approval only when the response is outbound (an email send leaves the
+        # user's trust boundary). Reading the user's own data back to them just redacts.
+        outbound = plan is not None and any(
+            f"{s.tool}.{s.action}" == pol.email_action for s in plan.steps)
+        text, pii = check_pii_leak(text, source_was_user=source_was_user, outbound=outbound)
+        if pii is not None:
+            hits.append(pii)
+
+    # STALE (2026-06-22): check_profanity retired (subjective, low value); no longer called.
+    # text, profanity = check_profanity(text, pol.profanity)
+    # if profanity is not None:
+    #     hits.append(profanity)
+
+    # Policy / tool-arg / destructive checks run for EVERY plan — a trusted read is NOT exempt
+    # from these (a denied action or oversized write arg must still be caught). check_tool_args
+    # slots between the deny-list check and the destructive-action check per the migration spec.
     for hit in (check_policy_tool_args(plan, pol.denied),
+                check_tool_args(plan, pol.google_event_cfg, pol.github_body_cfg),
                 check_destructive(plan, approval_actions=pol.approval_actions,
                                   email_action=pol.email_action,
                                   recipient_allowlist=pol.recipient_allowlist),
-                check_hallucination_citation(draft, {p.plan_id for p in retrieved_plans}),
                 await _mass_email_hit(plan, user_id)):
         if hit is not None:
             hits.append(hit)
+
+    # Hallucination-citation is a content scan on the draft, so it too is skipped for trusted reads.
+    if not trusted:
+        hallucination = check_hallucination_citation(draft, {p.plan_id for p in retrieved_plans})
+        if hallucination is not None:
+            hits.append(hallucination)
 
     text, length = check_length(text)
     if length is not None:

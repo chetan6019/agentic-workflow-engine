@@ -31,7 +31,8 @@ def fake_redis(monkeypatch):
 
 
 def _send_plan(n: int) -> ExecutionPlan:
-    steps = [PlanStep(id=f"s{i}", tool="gmail", action="send_email",
+    # STALE (2026-06-22): was tool="gmail"; gmail merged into the combined google MCP namespace.
+    steps = [PlanStep(id=f"s{i}", tool="google", action="send_email",
                       arguments={"to": "x@external.io"}) for i in range(n)]
     return ExecutionPlan(reasoning="r", steps=steps, strategy="sequential",
                          complexity_score=1, estimated_cost_usd=0.0, requires_approval=False)
@@ -75,7 +76,8 @@ async def test_mass_email_throttle_blocks(fake_redis, monkeypatch):
 async def test_evaluate_output_flags_destructive(fake_redis):
     plan = ExecutionPlan(reasoning="r", strategy="sequential", complexity_score=1,
                          estimated_cost_usd=0.0, requires_approval=False,
-                         steps=[PlanStep(id="s1", tool="calendar", action="delete_event")])
+                         # STALE (2026-06-22): was tool="calendar"; merged into google namespace.
+                         steps=[PlanStep(id="s1", tool="google", action="delete_event")])
     d = await engine.evaluate_output("done", draft=None, plan=plan, retrieved_plans=[],
                                      user_id="u", trace_id="t", source_was_user=False)
     assert d.requires_approval is True and d.allowed is True

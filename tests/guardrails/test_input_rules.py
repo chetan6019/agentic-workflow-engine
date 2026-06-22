@@ -35,7 +35,10 @@ def test_pii_redacted_before_llm():
     text = "my SSN is 123-45-6789 and card 4111 1111 1111 1111, email me at a@b.com"
     redacted, hit = ir.check_pii(text)
     assert hit is not None and hit.action == "redact"
-    assert "123-45-6789" not in redacted and "4111" not in redacted and "a@b.com" not in redacted
+    assert "123-45-6789" not in redacted and "4111" not in redacted
+    # Email addresses are KEPT — this is a mail assistant and the planner needs the
+    # recipient the user typed. Other PII is still scrubbed.
+    assert "a@b.com" in redacted
     assert PLACEHOLDER in redacted
 
 
@@ -56,7 +59,9 @@ def test_oversized_input_blocks():
     assert ir.check_oversized("a" * 100) is None
 
 
-def test_unsupported_language_flags():
-    hit = ir.check_language("これは日本語のテストですもっと文字をここに追加します")
-    assert hit is not None and hit.action == "warn"
-    assert ir.check_language("hello there, schedule a meeting") is None
+# STALE (2026-06-22): check_language retired (low-value signal); this test targets a removed
+# rule. Left commented in place per CLAUDE.md R13.
+# def test_unsupported_language_flags():
+#     hit = ir.check_language("これは日本語のテストですもっと文字をここに追加します")
+#     assert hit is not None and hit.action == "warn"
+#     assert ir.check_language("hello there, schedule a meeting") is None

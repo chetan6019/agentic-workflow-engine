@@ -18,10 +18,19 @@ def _draft(**kw) -> DraftResponse:
     return DraftResponse(**base)
 
 
-def test_pii_leak_redacts_and_flags_when_not_from_user():
+def test_pii_leak_flags_only_when_outbound():
+    # Outbound (an email send) carrying non-user PII still gates for approval.
     text = "Their SSN is 123-45-6789."
-    redacted, hit = orr.check_pii_leak(text, source_was_user=False)
+    redacted, hit = orr.check_pii_leak(text, source_was_user=False, outbound=True)
     assert hit is not None and hit.action == "flag_for_approval"
+    assert "123-45-6789" not in redacted
+
+
+def test_pii_leak_redacts_without_gating_when_displayed_to_user():
+    # Reading the user's own data back to them is not a leak: redact, don't gate.
+    text = "Their SSN is 123-45-6789."
+    redacted, hit = orr.check_pii_leak(text, source_was_user=False, outbound=False)
+    assert hit is not None and hit.action == "redact"
     assert "123-45-6789" not in redacted
 
 
@@ -81,9 +90,51 @@ def test_urls_are_not_treated_as_uncited():
     assert orr.check_hallucination_citation(draft, set()) is None
 
 
-def test_profanity_redacted():
-    redacted, hit = orr.check_profanity("this is crap honestly", ["crap"])
-    assert hit is not None and hit.action == "redact" and "crap" not in redacted
+# STALE (2026-06-22): check_profanity retired (subjective, low value); this test targets a
+# removed function. Left commented in place per CLAUDE.md R13.
+# def test_profanity_redacted():
+#     redacted, hit = orr.check_profanity("this is crap honestly", ["crap"])
+#     assert hit is not None and hit.action == "redact" and "crap" not in redacted
+
+
+# ── check_tool_args (google.create_event + github write paths) ───────────────
+_GOOGLE_EVENT_CFG = {"max_attendees": 10, "max_duration_hours": 8}
+_GITHUB_BODY_CFG = {"max_bytes": 8192}
+
+
+def test_tool_args_caps_attendees():
+    plan = _plan("google", "create_event", summary="s", start="2030-01-01T10:00:00",
+                 end="2030-01-01T11:00:00", attendees=[f"a{i}@x.com" for i in range(11)])
+    hit = orr.check_tool_args(plan, _GOOGLE_EVENT_CFG, _GITHUB_BODY_CFG)
+    assert hit is not None and hit.action == "block" and "attendees" in hit.detail
+
+
+def test_tool_args_caps_duration():
+    # 11h event exceeds the 8h cap.
+    plan = _plan("google", "create_event", summary="s", start="2030-01-01T09:00:00",
+                 end="2030-01-01T20:00:00")
+    hit = orr.check_tool_args(plan, _GOOGLE_EVENT_CFG, _GITHUB_BODY_CFG)
+    assert hit is not None and hit.action == "block" and "duration" in hit.detail
+
+
+def test_tool_args_caps_github_body():
+    plan = _plan("github", "create_issue", title="t", body="x" * 9000)  # > 8192 bytes
+    hit = orr.check_tool_args(plan, _GOOGLE_EVENT_CFG, _GITHUB_BODY_CFG)
+    assert hit is not None and hit.action == "block" and "body too large" in hit.detail
+
+
+def test_tool_args_happy_path():
+    plan = _plan("google", "create_event", summary="s", start="2030-01-01T10:00:00",
+                 end="2030-01-01T10:30:00", attendees=["a@x.com"])
+    assert orr.check_tool_args(plan, _GOOGLE_EVENT_CFG, _GITHUB_BODY_CFG) is None
+
+
+def test_is_trusted_read():
+    trusted = {"github.get_pr", "finnhub.get_quote"}
+    read_step = PlanStep(id="s1", tool="github", action="get_pr")
+    write_step = PlanStep(id="s2", tool="reddit", action="post_comment")
+    assert orr.is_trusted_read(read_step, trusted) is True
+    assert orr.is_trusted_read(write_step, trusted) is False
 
 
 def test_length_cap_truncates_and_warns():

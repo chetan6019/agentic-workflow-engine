@@ -18,7 +18,8 @@ __all__ = [
     "check_secrets",
     "check_pii",
     "check_oversized",
-    "check_language",
+    # STALE (2026-06-22): check_language retired (vague signal, low value).
+    # "check_language",
     "MAX_CHARS",
     "MAX_TOKENS",
 ]
@@ -82,8 +83,14 @@ def check_secrets(text: str) -> RuleHit | None:
 
 
 def check_pii(text: str) -> tuple[str, RuleHit | None]:
-    """Redact PII before the LLM sees it; report categories + counts, never values."""
-    redacted, counts = redact_pii(text)
+    """Redact PII before the LLM sees it; report categories + counts, never values.
+
+    Email addresses are KEPT (include_email=False): this is a mail assistant, so the
+    recipient address the user types is essential functional data the planner needs —
+    redacting it to [REDACTED] breaks every send request. Other PII (SSN, phone,
+    cards) is still scrubbed. Mirrors the output rule's reasoning.
+    """
+    redacted, counts = redact_pii(text, include_email=False)
     if counts:
         summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
         return redacted, RuleHit(rule="pii_redact", action="redact", severity="medium",
@@ -99,13 +106,16 @@ def check_oversized(text: str) -> RuleHit | None:
     return None
 
 
-def check_language(text: str) -> RuleHit | None:
-    """Flag (don't block) input that doesn't look like supported English text."""
-    letters = [c for c in text if c.isalpha()]
-    if len(letters) < 10:
-        return None
-    ascii_ratio = sum(c.isascii() for c in letters) / len(letters)
-    if ascii_ratio < 0.5:
-        return RuleHit(rule="unsupported_language", action="warn", severity="low",
-                       detail="input appears to be in an unsupported language")
-    return None
+# STALE (2026-06-22): check_language retired — a low-ASCII-ratio heuristic is a vague,
+# low-value signal that misfires on legitimate non-English input. Left in place per
+# CLAUDE.md R13 (comment, don't delete); no longer imported or called by the engine.
+# def check_language(text: str) -> RuleHit | None:
+#     """Flag (don't block) input that doesn't look like supported English text."""
+#     letters = [c for c in text if c.isalpha()]
+#     if len(letters) < 10:
+#         return None
+#     ascii_ratio = sum(c.isascii() for c in letters) / len(letters)
+#     if ascii_ratio < 0.5:
+#         return RuleHit(rule="unsupported_language", action="warn", severity="low",
+#                        detail="input appears to be in an unsupported language")
+#     return None
