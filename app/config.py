@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+
+# STALE (2026-06-22): `from typing import Literal` was unused (pre-existing); commented to keep
+# `ruff check` clean without deleting the line, per CLAUDE.md R13.
+# from typing import Literal
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
