@@ -25,7 +25,7 @@ class ToolSpec(BaseModel):
 
     name: str = Field(description="Tool name as exposed by the MCP server.")
     description: str = Field(description="Human-readable summary of what the tool does.")
-    server: str = Field(description="MCP server key (calendar | gmail | notion | slack).")
+    server: str = Field(description="MCP server key (google | github | reddit | finnhub).")
     input_schema: dict[str, Any] = Field(
         default_factory=dict, description="JSON schema for the tool's input arguments."
     )

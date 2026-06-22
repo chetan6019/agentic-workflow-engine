@@ -54,7 +54,9 @@ class MCPClient:
 
     def __init__(self, server_config: dict[str, dict[str, Any]]) -> None:
         """Build the adapter client and prepare the lazy tool registry."""
-        self._mcp = MultiServerMCPClient(server_config)
+        # Pre-existing: the adapter accepts plain connection dicts at runtime, but its type hint
+        # wants typed *Connection unions; ignore the arg-type mismatch (not introduced by this PR).
+        self._mcp = MultiServerMCPClient(server_config)  # type: ignore[arg-type]
         self._servers = set(server_config)
         self._tools_by_server: dict[str, dict[str, BaseTool]] = {}
 
@@ -160,10 +162,16 @@ def get_mcp_client() -> MCPClient:
         return {"url": f"{base.rstrip('/')}/mcp", "transport": "streamable_http"}
 
     server_config = {
-        "calendar": _ep(s.mcp_calendar_url),
-        "gmail": _ep(s.mcp_gmail_url),
-        "notion": _ep(s.mcp_notion_url),
-        "slack": _ep(s.mcp_slack_url),
+        # STALE (2026-06-22): the four old server keys are superseded by the google/github/
+        # reddit/finnhub entries below; commented (not deleted) per CLAUDE.md R13.
+        # "calendar": _ep(s.mcp_calendar_url),
+        # "gmail": _ep(s.mcp_gmail_url),
+        # "notion": _ep(s.mcp_notion_url),
+        # "slack": _ep(s.mcp_slack_url),
+        "google": _ep(s.mcp_google_url),
+        "github": _ep(s.mcp_github_url),
+        "reddit": _ep(s.mcp_reddit_url),
+        "finnhub": _ep(s.mcp_finnhub_url),
     }
     log.info("mcp_client_configured", servers=list(server_config))
     return MCPClient(server_config)

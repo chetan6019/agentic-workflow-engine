@@ -22,15 +22,19 @@ def _sanitize_retrieved(text: Any) -> str:
         s = s[:_RETRIEVED_TEXT_LIMIT] + "…"
     return s.replace("<", "‹").replace(">", "›")
 
+# STALE (2026-06-22): the server enum in this prompt previously read
+# "one of: calendar, gmail, notion, slack". Updated below to the google/github/reddit/finnhub
+# namespaces. The old value is preserved here per CLAUDE.md R13 since it cannot be commented
+# inside the prompt string itself (the planner would read the comment markers as prose).
 _PLANNER_SYS = """<instructions>
 You are a workflow planner. Given a user request, retrieved similar plans, and available tools,
 produce a typed ExecutionPlan. Use the minimum steps needed. Be explicit about dependencies.
 Prefer parallel execution when steps are independent.
-For EVERY step: `tool` MUST be the chosen tool's `server` value (one of: calendar, gmail,
-notion, slack) and `action` MUST be that tool's `name` (e.g. send_email, search_email).
+For EVERY step: `tool` MUST be the chosen tool's `server` value (one of: google, github,
+reddit, finnhub) and `action` MUST be that tool's `name` (e.g. send_email, search_email).
 NEVER put the action name in `tool`. Put the tool's parameters in `arguments` (omit
 user_id — it is injected automatically).
-When a step needs a date or time (e.g. calendar start/end), interpret every relative or
+When a step needs a date or time (e.g. google create_event start/end), interpret every relative or
 clock time ("tomorrow 9am", "next Monday") relative to the current moment and timezone
 given in <context>, and emit it as an RFC3339 timestamp that INCLUDES that timezone's UTC
 offset (e.g. 2026-06-11T09:00:00+05:30). Never emit a bare-UTC "Z" time for a local clock time.

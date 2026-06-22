@@ -14,7 +14,10 @@ from app.security.crypto import pack_token, unpack_token
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
 
-_ALLOWED_PROVIDERS = {"calendar", "gmail", "notion", "slack"}
+# STALE (2026-06-22): "calendar"/"gmail"/"notion"/"slack" providers superseded by google/github/
+# reddit. Kept here (additive, not deleted) per CLAUDE.md R13 so existing stored tokens still
+# resolve. "finnhub" is intentionally absent — it uses an env API key, not a per-user OAuth token.
+_ALLOWED_PROVIDERS = {"calendar", "gmail", "notion", "slack", "google", "github", "reddit"}
 # Access tokens within this many seconds of expiry are surfaced as "expiring".
 _EXPIRING_WINDOW_SEC = 300
 
