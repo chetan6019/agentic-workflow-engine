@@ -1,3 +1,8 @@
+# STALE (2026-06-22): this file's fake registry is built on the pre-migration server keys
+# {calendar, gmail, notion, slack}. The MCPClient mechanics it exercises (idempotency, cache,
+# retries, server/tool resolution) are namespace-agnostic, so the tests still pass — but the
+# fixture names are legacy. Kept in place and NOT re-pointed per CLAUDE.md R13; a later cleanup
+# PR should refresh the fake registry to {google, github, reddit, finnhub}.
 """MCP client tests: idempotency keys/cache, retries, unknown server/tool.
 
 An MCPClient is assembled over a fake tool registry and a dict-backed fake
