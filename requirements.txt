@@ -15,11 +15,12 @@ langchain-openai
 langchain-mcp-adapters
 # Local-embeddings extras (only needed when EMBEDDING_PROVIDER=hf — pulls in torch,
 # ~2-3GB). Default path uses the LiteLLM proxy, so these are left out of the image.
-# langchain-huggingface
-# sentence-transformers
+langchain-huggingface
+sentence-transformers
 
 # MCP servers
 fastmcp
+PyGithub
 
 # Data stores
 sqlalchemy[asyncio]
@@ -50,3 +51,6 @@ tzdata
 # Dev / testing
 pytest
 pytest-asyncio
+
+prometheus-client
+litellm==1.89.0
