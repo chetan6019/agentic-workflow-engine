@@ -2,24 +2,47 @@
 # Pure data: no code. Edited freely; loaded + cached by app/guardrails/engine.py.
 
 # (tool, action) pairs that are hard-blocked even if the planner produces them.
-denied_tool_actions: []
+# STALE (2026-06-22): empty deny-list superseded by explicit finnhub trade denies below.
+# denied_tool_actions: []
   # - { tool: gmail, action: delete_forever }
+# Defense-in-depth: these finnhub write/trade actions are NEVER implemented in the MCP,
+# but we deny them here too so a hallucinated planner step can never reach an upstream.
+denied_tool_actions:
+  - { tool: finnhub, action: place_order }
+  - { tool: finnhub, action: trade }
+  - { tool: finnhub, action: buy }
+  - { tool: finnhub, action: sell }
+  - { tool: finnhub, action: square_off }
 
-# Actions that ALWAYS require human approval before they run (destructive deletes).
+# Actions that ALWAYS require human approval before they run (destructive deletes + posts).
 approval_required_actions:
-  - calendar.delete_event
-  - slack.delete_message
+  # STALE (2026-06-22): old slack/calendar namespaces superseded by google/github/reddit.
+  # - calendar.delete_event
+  # - slack.delete_message
+  - google.delete_event
+  - google.delete_email
+  - github.delete_repo
+  - github.delete_branch
+  - github.close_pr
+  - github.close_issue
+  - reddit.post_comment
+  - reddit.submit
 
 # Sending mail is approval-gated only when the recipient domain is NOT allowlisted.
-email_send_action: gmail.send_email
+# STALE (2026-06-22): gmail namespace merged into the combined google MCP server.
+# email_send_action: gmail.send_email
+email_send_action: google.send_email
 recipient_allowlist:
   - example.com
   - acme.test
 
 # Small, configurable unsafe-content denylist; matches are redacted from responses.
-profanity:
-  - crap
-  - darn
+# STALE (2026-06-22): subjective, low-value list retired; check_profanity is now stale.
+# An empty list keeps the key valid so the engine still loads without a KeyError.
+# profanity:
+#   - crap
+#   - darn
+profanity: []
 
 # Throttle: max successful outbound emails per user per hour before output is blocked.
 max_emails_per_hour: 5
@@ -27,3 +50,38 @@ max_emails_per_hour: 5
 # Input rate caps (Redis counters), per user.
 rate_per_minute: 30
 rate_per_hour: 300
+
+# ── Tool-specific config consumed by output_rules.check_tool_args ────────────────
+# google.create_event sanity caps — an attendee/duration blow-up is usually a planner
+# mistake, so block it before it reaches Calendar. deny_past_start is a flag the calendar
+# tool itself honours (start-time parsing is outside the pure check_tool_args function).
+google_create_event:
+  max_attendees: 10
+  max_duration_hours: 8
+  deny_past_start: true
+
+# Max body size (bytes) for github.create_issue / github.comment_on_pr write paths.
+github_write_body:
+  max_bytes: 8192
+
+# Finnhub call-rate cap. Enforced as a Redis counter INSIDE the finnhub MCP server
+# (a call-rate cap is not an output-text concern); surfaced here for visibility.
+finnhub:
+  rate_per_minute: 60
+
+# Tool+action pairs whose RESPONSE skips the content-scan branch (secret/pii/hallucination)
+# of the output pipeline. They still get per-user auth + Redis rate caps — only the response
+# scans are skipped. Trusted because the upstream is the user's own account (github reads) or
+# structured JSON from a known endpoint (finnhub). See CLAUDE.md rule #6 carve-out.
+trusted_read_actions:
+  - github.list_my_prs
+  - github.get_pr
+  - github.search_code
+  - github.list_recent_commits
+  - finnhub.get_quote
+  - finnhub.get_company_profile
+  - finnhub.get_company_news
+  - finnhub.search_symbol
+  - finnhub.get_basic_financials
+  # Reddit reads are deliberately NOT trusted — public content is untrusted by nature,
+  # so the response scan stays ON for every reddit.* read.
