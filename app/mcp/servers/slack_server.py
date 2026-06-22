@@ -1,3 +1,5 @@
+# STALE (2026-06-22): retired in the google/github/reddit/finnhub migration (no replacement);
+# excluded from docker-compose and the MCP client registry. Kept in place per CLAUDE.md R13.
 """MCP Slack server — deterministic Slack Web API adapter on port 7004."""
 
 from __future__ import annotations
