@@ -109,3 +109,25 @@ async def test_empty_catalog_skips_validation(wire):
     assert state.error is None
     assert state.plan is not None
     assert len(invoked) == 1  # no validation attempted
+
+
+# ── no-op / greeting plans (regression: complexity_score 0 must validate) ─────
+
+
+def test_noop_plan_with_zero_complexity_is_valid():
+    # Regression: a greeting / standalone question yields steps=[] and complexity_score=0.
+    # The schema previously required complexity_score >= 1, so the whole run errored on a
+    # plain "hi". An empty no-tool plan must validate cleanly.
+    plan = ExecutionPlan(reasoning="greeting; no tools", steps=[], strategy="sequential",
+                         complexity_score=0, estimated_cost_usd=0.0, requires_approval=False)
+    assert plan.steps == [] and plan.complexity_score == 0
+
+
+async def test_noop_plan_passes_for_greeting(wire):
+    noop = ExecutionPlan(reasoning="greeting", steps=[], strategy="sequential",
+                         complexity_score=0, estimated_cost_usd=0.0, requires_approval=False)
+    invoked = wire([_spec("send_email", "google")], [noop])
+    state = await planner.planner_node(_state())
+    assert state.error is None
+    assert state.plan is not None and state.plan.steps == []
+    assert len(invoked) == 1  # empty steps → nothing to validate, no correction

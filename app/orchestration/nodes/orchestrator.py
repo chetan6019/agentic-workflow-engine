@@ -13,6 +13,7 @@ from zoneinfo import ZoneInfo
 from app.agents.response_composer import compose
 from app.config import get_settings
 from app.core.background import spawn
+from app.core.metrics import node_latency_seconds
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
 from app.mcp.client import get_mcp_client
@@ -21,15 +22,21 @@ from app.rag.retriever import retrieve
 
 log = structlog.get_logger(__name__)
 
-# Deletions always need human approval BEFORE they run, gated pre-execution here so we
-# never approve a removal that already happened. Updates are NOT pre-gated: an update is
-# only paused when its new time clashes with another event, which the calendar server
-# detects at execution time and routes through the same conflict path as a create.
+# Actions gated for human approval BEFORE they run, so we never approve something that
+# already happened: destructive deletes (always). Updates are NOT pre-gated: an update only
+# pauses when its new time clashes with another event, which the calendar server detects at
+# execution time via the conflict path.
+# STALE (2026-06-23): "send_email" removed from the pre-send approval gate — outbound email
+# sends no longer require HITL (user decision). NOTE: a sent mail can't be unsent, so the agent
+# now sends without review. The recipient-allowlist HITL in output_rules.check_destructive is
+# disabled in tandem (see there). Old set kept per CLAUDE.md R13 — re-add "send_email" to
+# restore the gate.
+# _APPROVAL_ACTIONS = {"delete_event", "delete_page", "send_email"}
 _APPROVAL_ACTIONS = {"delete_event", "delete_page"}
 
 
 def _needs_approval(steps: list[PlanStep]) -> bool:
-    """True if any plan step deletes an existing resource."""
+    """True if any plan step deletes a resource or sends an email (needs pre-approval)."""
     return any(s.action in _APPROVAL_ACTIONS for s in steps)
 
 
@@ -77,6 +84,11 @@ def _approval_draft(plan: ExecutionPlan) -> DraftResponse:
         if s.action not in _APPROVAL_ACTIONS:
             continue
         a = s.arguments
+        if s.action == "send_email":
+            subj = a.get("subject")
+            target = f"an email to {a.get('to') or 'a recipient'}"
+            items.append(f"send {target}" + (f' (subject: "{subj}")' if subj else ""))
+            continue
         verb = "delete" if s.action.startswith("delete_") else "update"
         if s.action.endswith("_event"):
             what = a.get("match_summary") or a.get("summary") or a.get("event_id") or "an event"
@@ -235,27 +247,34 @@ async def _run_finalize(state: AgentState) -> AgentState:
 
 async def orchestrator_node(state: AgentState) -> AgentState:
     """Dispatch to the correct phase handler based on current state."""
-    structlog.contextvars.bind_contextvars(trace_id=state.trace_id, user_id=state.user_id)
-    if state.error:
-        # A prior node (e.g. a failed planner) set an error; do no work — the router
-        # ends the run. Guards against re-running the entry phase after planner failure.
-        return state
-    phase = state.phase
-    log.info("orchestrator_node", phase=phase)
-    t0 = time.monotonic()
-    try:
-        if phase == "entry":
-            result = await _run_entry(state)
-        elif phase == "execute":
-            result = await _run_execute(state)
-        elif phase == "finalize":
-            result = await _run_finalize(state)
-        else:
+    with structlog.contextvars.bound_contextvars(
+        trace_id=state.trace_id,
+        user_id=state.user_id,
+        session_id=state.session_id,
+        node="orchestrator",
+        
+    ):
+        if state.error:
+            # A prior node (e.g. a failed planner) set an error; do no work — the router
+            # ends the run. Guards against re-running the entry phase after planner failure.
+            return state
+        phase = state.phase
+        log.info("orchestrator_node", phase=phase)
+        t0 = time.monotonic()
+        try:
+            if phase == "entry":
+                result = await _run_entry(state)
+            elif phase == "execute":
+                result = await _run_execute(state)
+            elif phase == "finalize":
+                result = await _run_finalize(state)
+            else:
+                result = state
+        except Exception as exc:
+            log.exception("orchestrator_failed", phase=phase, error=str(exc))
+            state.error = f"orchestrator_failed:{exc!s}"
             result = state
-    except Exception as exc:
-        log.exception("orchestrator_failed", phase=phase, error=str(exc))
-        state.error = f"orchestrator_failed:{exc!s}"
-        result = state
-    log.info("orchestrator_node_done", phase=phase,
-             duration_ms=int((time.monotonic() - t0) * 1000))
-    return result
+        log.info("orchestrator_node_done", phase=phase,
+                duration_ms=int((time.monotonic() - t0) * 1000))
+        node_latency_seconds.labels(node="orchestrator").observe(time.monotonic() - t0)
+        return result

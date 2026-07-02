@@ -57,7 +57,11 @@ class ExecutionPlan(BaseModel):
     strategy: Literal["sequential", "parallel", "mixed"] = Field(
         description="Execution strategy for the orchestrator."
     )
-    complexity_score: int = Field(ge=1, le=10, description="Planner self-rated complexity 1-10.")
+    complexity_score: int = Field(
+        ge=0, le=10,
+        description="Planner self-rated complexity. 0 = no tools needed (greeting / standalone "
+        "question answered directly); 1-10 for plans that invoke tools.",
+    )
     estimated_cost_usd: float = Field(ge=0.0, description="Rough estimated total cost in USD.")
     requires_approval: bool = Field(description="True if planner thinks HITL approval is needed.")
 

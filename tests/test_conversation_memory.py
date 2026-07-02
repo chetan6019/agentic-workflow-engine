@@ -48,3 +48,25 @@ def test_planner_prompt_omits_history_when_absent():
     human = _planner_human([])
     assert "<history>" not in human
     assert "<request>" in human  # rest of the prompt intact
+
+
+def test_history_block_compacts_older_turns():
+    # Rolling compaction: turns beyond the recent window land in <history_summary>
+    # with a tighter clip; the newest turns stay verbatim in <history>.
+    turns = [{"role": "user", "content": f"old turn {i} " + "y" * 300} for i in range(3)]
+    turns += [{"role": "user", "content": f"recent turn {i}"} for i in range(4)]
+    block = _history_block(turns)
+    assert block.index("<history_summary>") < block.index("<history>")
+    summary = block.split("</history_summary>")[0]
+    assert "old turn 0" in summary
+    # Older turns clip to the tight limit (role prefix + 80 chars), not 200.
+    assert "y" * 81 not in summary
+    recent = block.split("<history>")[1]
+    assert "recent turn 3" in recent and "old turn" not in recent
+
+
+def test_history_block_no_summary_within_recent_window():
+    turns = [{"role": "user", "content": f"turn {i}"} for i in range(4)]
+    block = _history_block(turns)
+    assert "<history_summary>" not in block
+    assert "turn 0" in block and "turn 3" in block

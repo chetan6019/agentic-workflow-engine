@@ -91,39 +91,39 @@ def test_guard_block_routes_to_end():
 
 def test_decide_high_confidence_finalizes():
     s = _state(confidence=0.9)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "finalize"
     assert s.phase == "finalize"
 
 
 def test_decide_medium_band_finalizes_while_hitl_disabled():
-    """0.55–0.85 auto-finalizes while _HITL_ENABLED is False (current default)."""
+    """0.55–0.85 auto-finalizes while HITL_ENABLED is False (current default)."""
     s = _state(confidence=0.7)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "finalize"
     assert s.requires_approval is False
 
 
 def test_decide_medium_band_hitl_when_enabled(monkeypatch):
     """Flipping _HITL_ENABLED makes the medium band ask for approval."""
-    monkeypatch.setattr(guard, "_HITL_ENABLED", True)
+    monkeypatch.setattr(guard, "HITL_ENABLED", True)
     s = _state(confidence=0.7)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "hitl"
     assert s.requires_approval is True
 
 
 def test_decide_boundary_085_finalizes_even_with_hitl(monkeypatch):
     """conf == 0.85 is outside the HITL band — always finalizes."""
-    monkeypatch.setattr(guard, "_HITL_ENABLED", True)
+    monkeypatch.setattr(guard, "HITL_ENABLED", True)
     s = _state(confidence=0.85)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "finalize"
 
 
 def test_decide_boundary_055_is_not_a_replan():
     s = _state(confidence=0.55)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "finalize"
 
 
@@ -132,7 +132,7 @@ def test_decide_low_confidence_replans_and_resets_state():
         confidence=0.4, retry_count=0, plan=_plan(), draft=_draft(),
         tool_results=[ToolResult(step_id="s1", ok=True, output={}, error=None, latency_ms=1)],
     )
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "replan"
     assert s.retry_count == 1
     assert s.plan is None
@@ -143,14 +143,14 @@ def test_decide_low_confidence_replans_and_resets_state():
 
 def test_decide_retry_exhaustion_blocks_with_explanation():
     s = _state(confidence=0.4, retry_count=2)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict == "block"
     assert s.error == "low_confidence_blocked"
 
 
 def test_decide_noops_when_error_already_set():
     s = _state(error="pii_detected", confidence=0.0)
-    guard._decide_verdict(s)
+    guard.decide_verdict(s)
     assert s.verdict is None  # router sends error states straight to END
 
 
