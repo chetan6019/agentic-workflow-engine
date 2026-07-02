@@ -49,10 +49,17 @@ model_list:
   # ---- Embeddings: local TEI container (no auth, no external dependency) ----
   # Note: the HF Inference Provider router requires a token with that scope,
   # which the current HF_TOKEN lacks (403). TEI is local and reliable.
-  - model_name: embed
+  # - model_name: embed
+  #   litellm_params:
+  #     model: huggingface/BAAI/bge-base-en-v1.5
+  #     api_base: http://tei:80
+  #     timeout: 30
+
+  - model_name: hf-embedding
     litellm_params:
       model: huggingface/BAAI/bge-base-en-v1.5
-      api_base: http://tei:80
+      api_key: os.environ/HF_TOKEN
+      api_base: https://api-inference.huggingface.co/v1
       timeout: 30
 
 litellm_settings:
@@ -61,9 +68,15 @@ litellm_settings:
   num_retries: 2
   request_timeout: 60
   # Langfuse tracing must be registered here as success/failure callbacks —
-  # a top-level `callbacks:` key is NOT recognized by LiteLLM.
-  success_callback: ["langfuse"]
-  failure_callback: ["langfuse"]
+  # a top-level `callbacks:` key is NOT recognized by LiteLLM. "prometheus" exposes
+  # per-call spend/token/latency metrics on the proxy's own /metrics endpoint (port 4000),
+  # which Prometheus scrapes as the `litellm` job (see infra/prometheus.yml). This is the
+  # canonical source for llm_cost_usd_total — cost stays LiteLLM's job, not the app's.
+  # NOTE: on some LiteLLM builds the Prometheus exporter is gated behind a LiteLLM key; if the
+  # proxy logs that prometheus is unavailable, the app's RED metrics still work — only the
+  # spend panels stay empty until a key is supplied.
+  success_callback: ["langfuse", "prometheus"]
+  failure_callback: ["langfuse", "prometheus"]
   # Response caching. Same pitfall as callbacks above: this must live under
   # litellm_settings as cache/cache_params — a top-level `cache:` key is
   # silently ignored by the proxy. One flat TTL: per-model TTL maps are not
@@ -79,10 +92,20 @@ litellm_settings:
     type: redis
     ttl: 600
     supported_call_types: ["completion", "acompletion"]
+  # Prompt PREFIX caching (distinct from the response cache above) is handled
+  # generically at the app layer: app/prompts.py orders every prompt
+  # stable-blocks-first (static system prompt, then tools/examples, with the
+  # per-call time/request at the end), so providers that cache prefixes
+  # automatically — OpenAI (>=1024-token prefixes) and Gemini (implicit
+  # caching) — get hits with zero config. Groq has no prompt caching today, so
+  # the ordering costs nothing there. If an Anthropic deployment is ever added
+  # to model_list, enable its explicit markers HERE (LiteLLM's
+  # cache_control_injection_points) — do NOT put provider-specific
+  # cache_control fields in app code; prompts stay provider-agnostic.
 
 router_settings:
   routing_strategy: simple-shuffle
-  num_retries: 2
+  num_retries: 0
   allowed_fails: 1
   cooldown_time: 30
   # When every Groq deployment for a model_name fails (e.g. TPM rate limit),

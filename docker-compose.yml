@@ -77,7 +77,7 @@ services:
       REDIS_URL: redis://redis:6379/1
       # DEBUG dumps full request/response blobs on every call — keep INFO unless
       # actively debugging LiteLLM internals.
-      LITELLM_LOG: INFO
+      LITELLM_LOG: DEBUG
     depends_on: [postgres, redis]
 
   # STALE (2026-06-22): the four service blocks below (mcp-calendar/gmail/notion/slack) are
@@ -151,6 +151,8 @@ services:
     ports: ["7005:7005"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-finnhub
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7005)))"]
       interval: 15s
@@ -166,6 +168,8 @@ services:
     ports: ["7006:7006"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-reddit
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7006)))"]
       interval: 15s
@@ -196,6 +200,8 @@ services:
     ports: ["7008:7008"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-google
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7008)))"]
       interval: 15s
@@ -223,6 +229,7 @@ services:
       MCP_GITHUB_URL: http://mcp-github:7007
       MCP_GOOGLE_URL: http://mcp-google:7008
       TZ: ${TZ:-UTC}
+      SERVICE_NAME: api
     depends_on:
       postgres:
         condition: service_healthy
@@ -248,8 +255,79 @@ services:
       # this container is the streamlit process itself).
       API_BASE_URL: http://api:8000
       TZ: ${TZ:-UTC}
+      SERVICE_NAME: streamlit
+    restart: on-failure
     depends_on: [api]
+
+  # ── Observability: metrics time-series + dashboards ──────────────────────────
+  # Prometheus scrapes the app's /metrics (RED latency + guardrail counters) and the
+  # LiteLLM proxy's /metrics (spend/tokens). Grafana visualizes both. See infra/prometheus.yml
+  # and infra/grafana/ for scrape + provisioning config.
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes:
+      - "./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "promdata:/prometheus"
+    restart: unless-stopped
+    depends_on: [api]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Anonymous read-only viewing so the dashboard opens without a login in local dev.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - "./infra/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro"
+      - "grafanadata:/var/lib/grafana"
+    restart: unless-stopped
+    depends_on: [prometheus]
+
+  # ── Logs: structlog JSON (stdout) → Alloy → Loki → Grafana ───────────────────
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    ports: ["3100:3100"]
+    volumes:
+      - "./infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro"
+      - "lokidata:/loki"
+    restart: unless-stopped
+
+  # Grafana Alloy is the supported successor to Promtail. It discovers the compose
+  # containers over the Docker socket, parses each structlog JSON line, and ships to
+  # Loki. The socket mount is what lets it see the other containers' logs.
+  alloy:
+    image: grafana/alloy:latest
+    # Run as root so the alloydata volume mounted at /var/lib/alloy/data is
+    # writable. The image's default `alloy` user (UID 473) cannot write to a fresh
+    # named-volume mount — that silently broke positions-file tracking and meant
+    # loki.source.docker shipped nothing reliably to Loki.
+    user: "0:0"
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    ports: ["12345:12345"]
+    volumes:
+      - "./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro"
+      # Persist Alloy's positions cursor across restarts so tailing resumes where
+      # it left off instead of jumping to "now" and dropping anything older.
+      - "alloydata:/var/lib/alloy/data"
+      - "/var/lib/docker/containers:/var/lib/docker/containers:ro"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    restart: unless-stopped
+    depends_on: [loki]
 
 volumes:
   pgdata:
   qdrantdata:
+  promdata:
+  grafanadata:
+  lokidata:
+  alloydata:
