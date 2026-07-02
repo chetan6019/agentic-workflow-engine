@@ -1,0 +1,11 @@
+# Grafana datasource provisioning: wire Loki for logs alongside the Prometheus
+# metrics source, so dashboards + Explore can correlate metrics and logs by time.
+apiVersion: 1
+
+datasources:
+  - name: Loki
+    uid: loki
+    type: loki
+    access: proxy
+    url: http://loki:3100
+    editable: true

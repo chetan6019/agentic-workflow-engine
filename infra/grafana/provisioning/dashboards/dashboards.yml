@@ -1,0 +1,13 @@
+# Grafana dashboard provisioning: load any dashboard JSON dropped into the mounted folder.
+apiVersion: 1
+
+providers:
+  - name: workflow-dashboards
+    orgId: 1
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /var/lib/grafana/dashboards
+      foldersFromFilesStructure: false

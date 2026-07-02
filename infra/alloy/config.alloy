@@ -1,0 +1,78 @@
+// Grafana Alloy — ship docker container stdout (structlog JSON) to Loki.
+// Pipeline: discover compose containers -> label by service -> read logs ->
+// parse structlog JSON -> write to Loki.
+
+// 1. Discover running containers via the Docker socket.
+discovery.docker "compose" {
+  host             = "unix:///var/run/docker.sock"
+  refresh_interval = "10s"
+}
+
+// 2. Promote docker metadata to LOW-CARDINALITY labels only.
+discovery.relabel "compose" {
+  targets = discovery.docker.compose.targets
+
+  rule {
+    source_labels = ["__meta_docker_container_name"]
+    regex         = "/(.*)"
+    target_label  = "container"
+  }
+
+  rule {
+    source_labels = ["__meta_docker_container_label_com_docker_compose_service"]
+    target_label  = "service"
+  }
+}
+
+// 3. Tail discovered containers' stdout/stderr.
+//    `refresh_interval` syncs the active target set with discovery — without it,
+//    targets are read once at startup and new containers (or restarts that
+//    change container IDs) are missed until Alloy is restarted.
+loki.source.docker "compose" {
+  host             = "unix:///var/run/docker.sock"
+  targets          = discovery.relabel.compose.output
+  refresh_interval = "10s"
+  forward_to       = [loki.process.structlog.receiver]
+}
+
+// 4. Parse the structlog JSON. Extract useful fields so `| json | <field>="..."`
+//    works at query time, but promote ONLY `level` to a label.
+//    `event`, `trace_id`, `user_id`, `session_id` stay in the line body —
+//    high or unbounded cardinality => never a label.
+loki.process "structlog" {
+  forward_to = [loki.write.default.receiver]
+
+  stage.json {
+    expressions = {
+      level      = "level",
+      event      = "event",
+      trace_id   = "trace_id",
+      user_id    = "user_id",
+      session_id = "session_id",
+      timestamp  = "timestamp",
+    }
+  }
+
+  stage.labels {
+    values = {
+      level = "",     // only low-cardinality field promoted to a label
+    }
+  }
+
+  // STALE (2026-06-24): timestamp parsing was silently dropping lines when
+  // structlog's format didn't match exactly. Reverted to ingestion time — fine
+  // in dev. To re-enable, first run `docker compose logs api | head -1 | jq .timestamp`
+  // to confirm the exact format structlog emits and match `format` to it.
+  // stage.timestamp {
+  //   source = "timestamp"
+  //   format = "RFC3339Nano"
+  //   fallback_formats = ["RFC3339"]
+  // }
+}
+
+// 5. Push to Loki.
+loki.write "default" {
+  endpoint {
+    url = "http://loki:3100/loki/api/v1/push"
+  }
+}

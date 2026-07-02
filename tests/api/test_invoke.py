@@ -3,8 +3,30 @@
 from __future__ import annotations
 
 import app.main as main_mod
+from app.api.invoke import _phase_label
+from app.core.state import AgentState, ExecutionPlan, PlanStep
 from app.guardrails.input_rules import MAX_CHARS
 from app.main import app
+
+
+def _state() -> AgentState:
+    return AgentState(trace_id="t", user_id="u", session_id="s", user_request="hi")
+
+
+def test_phase_label_processing_for_no_tool_plan():
+    # Greeting / direct answer: an empty-steps plan must show "processing", not "executing tools".
+    state = _state()
+    state.plan = ExecutionPlan(reasoning="greeting", steps=[], strategy="sequential",
+                               complexity_score=0, estimated_cost_usd=0.0, requires_approval=False)
+    assert _phase_label(state) == "⏳ processing"
+
+
+def test_phase_label_executing_for_tool_plan():
+    state = _state()
+    state.plan = ExecutionPlan(
+        reasoning="send", steps=[PlanStep(id="s1", tool="google", action="send_email")],
+        strategy="sequential", complexity_score=2, estimated_cost_usd=0.0, requires_approval=False)
+    assert _phase_label(state) == "🔧 executing tools"
 
 
 def test_testclient_startup_probe():
