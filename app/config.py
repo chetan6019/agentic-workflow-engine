@@ -52,9 +52,20 @@ class Settings(BaseSettings):
     # queries the dense named vector only. The collection schema always carries both
     # vectors, so flipping this needs no re-index.
     hybrid_search_enabled: bool = True
+    # When true the retriever adds a cross-encoder rerank pass between hybrid search and
+    # the LLM grader: it re-scores candidate plans by joint (query, summary) relevance and
+    # keeps the top few. Pure-CPU, model downloaded once, NOT an LLM call (mirrors the BM25
+    # path). Off by default so the download/compute is opt-in; flip RERANK_ENABLED to turn on.
+    rerank_enabled: bool = False
+    rerank_model: str = "Xenova/ms-marco-MiniLM-L-6-v2"
     # Max requests per identity (user_id, or client IP when unauthenticated) per
     # 60s window, enforced in the API middleware. Override with RATE_LIMIT_PER_MIN.
     rate_limit_per_min: int = 60
+    # TTL (seconds) for the retriever-router decision cache in Redis: a repeated
+    # (normalized) request skips the router LLM call entirely. 0 disables the cache.
+    # Safe to cache — the decision depends only on the request text, not on live
+    # tool state or time. Override with ROUTER_CACHE_TTL_SEC.
+    router_cache_ttl_sec: int = 3600
     # Hard ceiling on a single workflow run; a run exceeding it is marked
     # run_timeout instead of hanging forever. Override with RUN_TIMEOUT_SEC.
     run_timeout_sec: int = 120

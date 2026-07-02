@@ -48,8 +48,15 @@ def _resolved_provider() -> Provider:
     return get_settings().embedding_provider
 
 
+@lru_cache(maxsize=1)
 def _build_embeddings(provider: Provider) -> Embeddings:
-    """Construct a LangChain embeddings client for the given provider."""
+    """Construct (once) the LangChain embeddings client for the given provider.
+
+    Cached like ``_bm25`` below: under EMBEDDING_PROVIDER=hf this loads the
+    sentence-transformers model into memory, which is multi-second and CPU-bound.
+    Rebuilding it per call starved the event loop and timed out the UI's phase
+    poll; with the cache the model loads once and stays resident.
+    """
     s = get_settings()
     if provider == "hf":
         try:
@@ -93,6 +100,30 @@ async def embed_text(text: str) -> list[float]:
     return vec
 
 
+async def warmup_embedder() -> None:
+    """Pre-load every in-process model at startup so no request pays the cold-start.
+
+    Retrieval embeds twice and BOTH paths load a CPU-bound model on first use that,
+    held under the GIL, would block the event loop and time out the UI's phase poll:
+
+    - BM25 sparse (``_bm25`` / ``Qdrant/bm25``) — the lexical half of hybrid search,
+      loaded regardless of the dense provider, so warm it whenever hybrid is on.
+    - Dense sentence-transformers — only in-process (and heavy) for the ``hf``
+      provider; the ``openai`` provider just builds a lightweight HTTP client, so
+      warming it would only add a startup call to LiteLLM — skip it.
+
+    Both warm calls run off the event loop and populate their respective caches.
+    """
+    if get_settings().hybrid_search_enabled:
+        await embed_sparse("warmup")
+    if get_settings().rerank_enabled:
+        # Cross-encoder is the same kind of CPU-bound, GIL-holding model as BM25, so
+        # warm it off the loop too — otherwise the first reranked request blocks.
+        await rerank_scores("warmup", ["warmup"])
+    if _resolved_provider() == "hf":
+        await asyncio.to_thread(lambda: _build_embeddings("hf").embed_query("warmup"))
+
+
 @lru_cache(maxsize=1)
 def _bm25() -> Any:
     """Lazily build the cached BM25 sparse encoder (downloads the model on first use)."""
@@ -112,3 +143,30 @@ async def embed_named(text: str) -> dict[str, Any]:
     dense = await embed_text(text)
     sparse = await embed_sparse(text)
     return {DENSE_VECTOR: dense, SPARSE_VECTOR: sparse}
+
+
+@lru_cache(maxsize=1)
+def _cross_encoder() -> Any:
+    """Lazily build the cached cross-encoder reranker (downloads the model on first use).
+
+    Like ``_bm25``, this is a pure-CPU model with no network at query time after the
+    one-off download, and it is NOT an LLM embedding call — so it keeps the
+    LiteLLM-only rule intact. It jointly encodes (query, document) pairs to produce a
+    relevance score, which a bi-encoder (our dense embeddings) cannot do.
+    """
+    from fastembed.rerank.cross_encoder import TextCrossEncoder
+
+    return TextCrossEncoder(model_name=get_settings().rerank_model)
+
+
+async def rerank_scores(query: str, documents: list[str]) -> list[float]:
+    """Return cross-encoder relevance scores for each document vs query, aligned by index.
+
+    Runs the CPU-bound model off the event loop (same as BM25) so it never blocks the
+    loop and times out the UI's phase poll. Empty input returns an empty list.
+    """
+    if not documents:
+        return []
+    return await asyncio.to_thread(
+        lambda: list(_cross_encoder().rerank(query, documents))
+    )
