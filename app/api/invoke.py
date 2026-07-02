@@ -13,6 +13,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import get_settings
 from app.core.background import spawn
+from app.core.metrics import workflow_run_latency_seconds
 from app.core.state import AgentState
 from app.data.redis_client import get_redis
 from app.guardrails import evaluate_input
@@ -58,8 +59,11 @@ class InvokeResponse(BaseModel):
 
 _PHASE_KEY = "phase:{trace_id}"
 _PHASE_TTL = 600
-# Prior conversation turns fed to the planner for follow-up resolution.
-_HISTORY_TURNS = 6
+# Prior conversation turns fed to the planner for follow-up resolution. _history_block
+# applies rolling compaction: the newest 4 turns render verbatim (200-char clip) and older
+# turns compact to 80-char lines — so 8 turns (4 exchanges) costs barely more than the old
+# 4-turn window while letting follow-ups reach further back.
+_HISTORY_TURNS = 8
 # Idempotency-Key → trace_id mapping TTL (replays within this window return the
 # original run instead of starting a duplicate).
 _IDEM_KEY = "idem:{user_id}:{key}"
@@ -72,6 +76,12 @@ def _phase_label(state: AgentState) -> str:
         return "❌ failed"
     if state.requires_approval:
         return "🛑 awaiting approval"
+    # Greeting / direct-answer runs invoke no tools. Once the (empty) plan exists, collapse the
+    # tool-oriented phases into a single "processing" pill so the UI never shows "executing
+    # tools" / "composing reply" for a request that runs none. (The brief pre-plan retrieving/
+    # planning phases are generic and apply to every run, so they're left as-is.)
+    if state.plan is not None and not state.plan.steps:
+        return "⏳ processing"
     if state.draft and state.verdict is not None:
         return "💾 finalizing"
     if state.draft:
@@ -139,8 +149,18 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     # from Postgres, so it's never read again — see discard_thread).
     await discard_thread(initial.trace_id)
     await _set_phase(initial.trace_id, _phase_label(final_state), owner, done=True)
+    elapsed = time.monotonic() - started
+    # Outcome label for the Prometheus histogram: a timed-out run is distinct from a
+    # generic error so the dashboard can separate "slow" from "broken".
+    if final_state.error == "run_timeout":
+        outcome = "timeout"
+    elif final_state.error:
+        outcome = "error"
+    else:
+        outcome = "ok"
+    workflow_run_latency_seconds.labels(outcome=outcome).observe(elapsed)
     log.info("workflow_run_done", trace_id=initial.trace_id,
-             duration_ms=int((time.monotonic() - started) * 1000),
+             duration_ms=int(elapsed * 1000),
              has_draft=final_state.draft is not None, error=final_state.error)
 
 

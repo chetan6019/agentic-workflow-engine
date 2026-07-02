@@ -11,11 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api import approvals, auth, feedback, health, integrations, invoke, sessions
+from app.api.middleware import RequestContextMiddleware, RequestDurationMiddleware
 from app.config import get_settings
-from app.core.background import drain
+from app.core.background import drain, spawn
 from app.data.db import get_engine, init_db
 from app.data.redis_client import check_rate_limit, get_redis
 from app.logging import configure_logging
+from app.rag.embedder import warmup_embedder
 from app.rag.qdrant_client import get_qdrant
 from app.security.jwt_tokens import decode_access_token
 
@@ -31,11 +33,25 @@ _SHUTDOWN_GRACE_SEC = 10
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Create DB schema before serving; drain background work and close pools on stop."""
+    """Create DB schema, then serve immediately while warming models in the background."""
+    configure_logging()
     await init_db()
+    # Warm the in-process embedding models OFF the boot path so the api comes up
+    # instantly. They load concurrently in the background; the only cost is that a
+    # query arriving in the first few seconds may still pay the cold-start once.
+    spawn(_warmup())
     log.info("app_started")
     yield
     await _shutdown()
+
+
+async def _warmup() -> None:
+    """Background model warmup; a failure only means a slow first request, not a crash."""
+    try:
+        await warmup_embedder()
+        log.info("embedder_warmed")
+    except Exception as exc:
+        log.warning("embedder_warmup_failed", error=str(exc))
 
 
 async def _shutdown() -> None:
@@ -78,12 +94,17 @@ def _client_ip(request: Request) -> str:
 
 def create_app() -> FastAPI:
     """Build and configure the FastAPI application."""
-    configure_logging()
     s = get_settings()
 
     app = FastAPI(title="Workflow Agent API", version="1.0.0", lifespan=_lifespan)
 
     app.middleware("http")(_auth_and_rate_limit)
+
+    app.add_middleware(RequestContextMiddleware)
+    # HTTP RED metric — registered AFTER RequestContextMiddleware in source order
+    # so it runs OUTERMOST and times the full request including auth + rate-limit
+    # (Starlette runs middleware outermost-first; last added is outermost).
+    app.add_middleware(RequestDurationMiddleware)
 
     app.add_middleware(
         CORSMiddleware,
