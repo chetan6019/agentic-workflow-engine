@@ -35,20 +35,21 @@ _EMAIL_IN = re.compile(r"[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})")
 
 def check_pii_leak(text: str, *, source_was_user: bool,
                    outbound: bool = False) -> tuple[str, RuleHit | None]:
-    """Redact PII in a response; flag for approval only when it would actually leak.
+    """Redact PII from a response — redact-only, never gates.
 
-    PII is always redacted from the shown text. It escalates to ``flag_for_approval``
-    only when the response is OUTBOUND (an email send leaving the user's trust
-    boundary) and the PII didn't originate from the user. Displaying the user's own
-    data back to them — reading their inbox, calendar, etc. — is not a leak, so it
-    redacts without gating. Outbound exfiltration is also covered by check_destructive.
+    PII is scrubbed from the shown text regardless of direction. ``source_was_user`` /
+    ``outbound`` are still recorded in the hit detail for observability.
     """
     redacted, counts = redact_pii(text, include_email=False)
     if not counts:
         return text, None
     summary = ", ".join(f"{k}×{v}" for k, v in sorted(counts.items()))
-    escalate = outbound and not source_was_user
-    action: Action = "flag_for_approval" if escalate else "redact"
+    # STALE (2026-06-24): the outbound→flag_for_approval escalation was removed. Email sends are
+    # no longer HITL-gated (user decision), and this scan runs POST-send (the mail is already
+    # out), so escalating to approval was pointless. PII is still REDACTED. Kept per R13.
+    # escalate = outbound and not source_was_user
+    # action: Action = "flag_for_approval" if escalate else "redact"
+    action: Action = "redact"
     return redacted, RuleHit(rule="pii_leak", action=action, severity="medium",
                              detail=f"response contained PII ({summary}); "
                                     f"source_was_user={source_was_user}, outbound={outbound}")
@@ -163,11 +164,14 @@ def check_destructive(plan: ExecutionPlan | None, *, approval_actions: set[str],
         if key in approval_actions:
             return RuleHit(rule="destructive_action", action="flag_for_approval", severity="high",
                            detail=f"destructive action requires approval: {key}")
-        if key == email_action:
-            external = [d for d in recipients_of(step.arguments) if d not in recipient_allowlist]
-            if external:
-                return RuleHit(rule="destructive_action", action="flag_for_approval", severity="high",
-                               detail=f"email to non-allowlisted domain(s): {', '.join(sorted(set(external)))}")
+        # STALE (2026-06-23): recipient-allowlist HITL for email sends disabled — sends no longer
+        # require approval (user decision; paired with removing send_email from the orchestrator
+        # pre-send gate). Kept per CLAUDE.md R13; uncomment to restore the allowlist gate.
+        # if key == email_action:
+        #     external = [d for d in recipients_of(step.arguments) if d not in recipient_allowlist]
+        #     if external:
+        #         return RuleHit(rule="destructive_action", action="flag_for_approval", severity="high",
+        #                        detail=f"email to non-allowlisted domain(s): {', '.join(sorted(set(external)))}")
     return None
 
 

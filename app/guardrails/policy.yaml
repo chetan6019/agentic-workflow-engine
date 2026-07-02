@@ -83,5 +83,26 @@ trusted_read_actions:
   - finnhub.get_company_news
   - finnhub.search_symbol
   - finnhub.get_basic_financials
+  # Google READ tools — the user's OWN Gmail inbox + Calendar are single-user-owned data,
+  # same trust basis as the github.* reads above. Without this, read-only "show my unread
+  # emails" / "what's on my calendar" got spuriously gated for HITL approval by the
+  # hallucination-citation scan. Writes (send_email/create_draft/create_event/update_event)
+  # are deliberately NOT here. See docs/adr/0009-google-read-trusted-carveout.md.
+  - google.search_email
+  - google.get_thread
+  - google.list_upcoming
+  - google.find_free_slot
   # Reddit reads are deliberately NOT trusted — public content is untrusted by nature,
   # so the response scan stays ON for every reddit.* read.
+
+# Tool+action WRITE pairs that have already EXECUTED by the time the OUTPUT pipeline runs
+# (the orchestrator runs tools before the guard). For these the hallucination-citation scan must
+# NOT flag_for_approval: the write already happened, so a HITL pause is pointless and a resume
+# would re-run execute and DUPLICATE the action — the same reasoning that stopped HITL-gating
+# email sends. Calendar create/update belong here (a confirmation draft cites the freshly-created
+# event id, which isn't in the retrieved plan ids, and would otherwise be flagged). The clashing-
+# slot case is unaffected: the orchestrator's conflict path pauses BEFORE the event is created, so
+# the guard never runs for it. Email sends are covered separately via email_send_action.
+executed_write_actions:
+  - google.create_event
+  - google.update_event

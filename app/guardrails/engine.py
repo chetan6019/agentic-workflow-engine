@@ -64,6 +64,8 @@ class _Policy(NamedTuple):
     github_body_cfg: dict[str, object]
     finnhub_cfg: dict[str, object]
     trusted_read_actions: set[str]
+    # Writes that already executed before the OUTPUT guard runs; the citation scan must not gate them.
+    executed_write_actions: set[str]
 
 
 @lru_cache(maxsize=1)
@@ -84,6 +86,7 @@ def _policy() -> _Policy:
         github_body_cfg=dict(raw.get("github_write_body") or {}),
         finnhub_cfg=dict(raw.get("finnhub") or {}),
         trusted_read_actions=set(raw.get("trusted_read_actions") or []),
+        executed_write_actions=set(raw.get("executed_write_actions") or []),
     )
 
 
@@ -214,6 +217,22 @@ async def evaluate_output(text: str, *, draft: DraftResponse | None,
         log.info("guardrail_trusted_read_skip", trace_id=trace_id,
                  steps=[f"{s.tool}.{s.action}" for s in plan.steps])
 
+    # An outbound email send both leaves the user's trust boundary AND has already executed by the
+    # time this OUTPUT pipeline runs (the orchestrator runs tools before the guard). Computed once,
+    # used twice below: PII still REDACTS on outbound, but no content scan may FLAG a send for
+    # approval — the mail is already sent, so a HITL pause is pointless and a resume would re-send.
+    outbound = plan is not None and any(
+        f"{s.tool}.{s.action}" == pol.email_action for s in plan.steps)
+
+    # A calendar create/update is ALSO an already-executed write by the time this OUTPUT pipeline
+    # runs. Its confirmation draft cites the freshly-created event id (absent from retrieved_plans),
+    # which check_hallucination_citation would flag_for_approval — pausing a meeting that already
+    # exists and DUPLICATING it on resume. Same reasoning as the outbound-send carve-out, so these
+    # plans skip the hallucination scan too. The clashing-slot case is unaffected: the orchestrator
+    # pauses on a conflict BEFORE the event is created, so the guard never runs for it.
+    executed_write = plan is not None and any(
+        f"{s.tool}.{s.action}" in pol.executed_write_actions for s in plan.steps)
+
     if not trusted:
         secret = check_secret_leak(text)
         if secret is not None:
@@ -222,8 +241,6 @@ async def evaluate_output(text: str, *, draft: DraftResponse | None,
 
         # PII gates approval only when the response is outbound (an email send leaves the
         # user's trust boundary). Reading the user's own data back to them just redacts.
-        outbound = plan is not None and any(
-            f"{s.tool}.{s.action}" == pol.email_action for s in plan.steps)
         text, pii = check_pii_leak(text, source_was_user=source_was_user, outbound=outbound)
         if pii is not None:
             hits.append(pii)
@@ -245,8 +262,12 @@ async def evaluate_output(text: str, *, draft: DraftResponse | None,
         if hit is not None:
             hits.append(hit)
 
-    # Hallucination-citation is a content scan on the draft, so it too is skipped for trusted reads.
-    if not trusted:
+    # Hallucination-citation is a content scan on the draft, so it's skipped for trusted reads AND
+    # for already-executed writes (outbound email sends + calendar create/update). Those actions
+    # have already happened by now; flagging their draft for approval would only pause a completed
+    # action and re-run it on resume (re-send the mail / DUPLICATE the event) — same reasoning that
+    # dropped the outbound-PII escalation to redact-only (see check_pii_leak). They aren't HITL-gated.
+    if not trusted and not outbound and not executed_write:
         hallucination = check_hallucination_citation(draft, {p.plan_id for p in retrieved_plans})
         if hallucination is not None:
             hits.append(hallucination)

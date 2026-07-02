@@ -85,6 +85,15 @@ async def test_low_risk_leaves_draft_untouched(wire):
     assert state.confidence > 0
 
 
+async def test_mid_band_risk_no_longer_mitigates(wire):
+    """Regression: risk 0.8 used to trip mitigation (limit 0.7); the limit is now 0.85, so a
+    faithfully-summarised draft scored 0.8 finalizes untouched — no re-compose, no warning."""
+    wire([_verdict(0.8)])
+    state = await guard.guardrails_node(_state())
+    assert state.draft.detail_markdown == "original body"
+    assert state.degraded == []
+
+
 async def test_high_then_low_recomposes_without_warning(wire):
     """Re-composition resolves the risk → new draft, no warning, no degraded flag."""
     compose_stub = wire([_verdict(0.9), _verdict(0.1)])
