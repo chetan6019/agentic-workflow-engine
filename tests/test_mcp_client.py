@@ -13,12 +13,15 @@ adapter construction; the preloaded ``_tools_by_server`` registry means
 
 from __future__ import annotations
 
+import json
+import time
+
 import httpx
 import pytest
 
 from app.core.state import ToolResult
 from app.mcp import client as mcp_client
-from app.mcp.client import MCPClient, _idempotency_key
+from app.mcp.client import MCPClient, _idempotency_key, _to_tool_result
 
 
 class _FakeRedis:
@@ -147,6 +150,33 @@ async def test_unknown_server_returns_failed_result(fake_redis):
     result = await c.call_tool("fax", "beep", {}, trace_id="t", step_id="s1")
     assert result.ok is False
     assert (result.error or "").startswith("unknown_server")
+
+
+# ── tool-output normalisation ────────────────────────────────────────────────
+# Regression for "show top 3 emails only showed 1": the adapter returns MCP
+# content blocks ([{"type": "text", "text": "<json>"}]); left unparsed, the whole
+# result is ONE long string that prompt compaction clips to 200 chars — silently
+# dropping every email after the first. The client must parse it to a dict.
+
+
+def test_to_tool_result_parses_content_block_envelope():
+    payload = {"query": "is:unread",
+               "messages": [{"id": "1"}, {"id": "2"}, {"id": "3"}]}
+    envelope = [{"type": "text", "text": json.dumps(payload)}]
+    result = _to_tool_result("s1", envelope, time.monotonic())
+    assert result.output == payload  # structured fields, not a serialized blob
+
+
+def test_to_tool_result_parses_bare_json_string():
+    payload = {"ok": True, "id": "abc"}
+    result = _to_tool_result("s1", json.dumps(payload), time.monotonic())
+    assert result.output == payload
+
+
+def test_to_tool_result_wraps_non_json_values():
+    assert _to_tool_result("s1", "plain text", time.monotonic()).output == {"value": "plain text"}
+    assert _to_tool_result("s1", [1, 2], time.monotonic()).output == {"value": [1, 2]}
+    assert _to_tool_result("s1", {"already": "dict"}, time.monotonic()).output == {"already": "dict"}
 
 
 async def test_swapped_server_and_tool_are_resolved(fake_redis):

@@ -20,6 +20,7 @@ from tenacity import (
 )
 
 from app.config import get_settings
+from app.core.metrics import mcp_tool_latency_seconds
 from app.core.state import ToolResult, ToolSpec
 from app.data.redis_client import get_redis
 
@@ -40,13 +41,41 @@ def _idempotency_key(trace_id: str, step_id: str, tool: str, args: dict[str, Any
     return hashlib.sha256(raw).hexdigest()
 
 
+def _parse_tool_output(raw: Any) -> dict[str, Any]:
+    """Unwrap and parse the adapter's return value into the tool's structured dict.
+
+    MCP servers return JSON, but the transport can wrap it: the adapter may hand
+    us the dict itself, a JSON string, or a content-block envelope like
+    [{"type": "text", "text": "<json>"}]. Parse down to real fields — if the
+    result stays one serialized string, prompt compaction later clips it at
+    _RESULT_STR_LIMIT chars and silently loses items (an email list showed only
+    its first entry to the composer). Non-JSON values keep the {"value": ...}
+    wrap so ToolResult.output is always a dict.
+    """
+    # A single text content block → unwrap to its inner text, then fall through.
+    if (isinstance(raw, list) and len(raw) == 1 and isinstance(raw[0], dict)
+            and raw[0].get("type") == "text"):
+        raw = raw[0].get("text", "")
+    if isinstance(raw, str):
+        try:
+            parsed = json.loads(raw)
+        except (json.JSONDecodeError, ValueError):
+            return {"value": raw}
+        if isinstance(parsed, dict):
+            return parsed
+        return {"value": parsed}
+    if isinstance(raw, dict):
+        return raw
+    return {"value": raw}
+
+
 def _to_tool_result(step_id: str, raw: Any, started: float, error: str | None = None) -> ToolResult:
     """Normalise an adapter return value (or error) into a ToolResult."""
     latency = int((time.monotonic() - started) * 1000)
     if error is not None:
         return ToolResult(step_id=step_id, ok=False, output=None, error=error, latency_ms=latency)
-    output = raw if isinstance(raw, dict) else {"value": raw}
-    return ToolResult(step_id=step_id, ok=True, output=output, error=None, latency_ms=latency)
+    return ToolResult(step_id=step_id, ok=True, output=_parse_tool_output(raw),
+                      error=None, latency_ms=latency)
 
 
 class MCPClient:
@@ -122,6 +151,8 @@ class MCPClient:
                         step=step_id, error=str(exc))
             result = _to_tool_result(step_id, None, started, error=str(exc))
 
+        mcp_tool_latency_seconds.labels(
+            server=server, ok=str(result.ok).lower()).observe(result.latency_ms / 1000)
         await redis.set(f"mcp:{key}", result.model_dump_json(), ex=_CACHE_TTL_SEC)
         log.info("mcp_tool_call_done", server=server, tool=tool, step=step_id,
                  ok=result.ok, latency_ms=result.latency_ms)

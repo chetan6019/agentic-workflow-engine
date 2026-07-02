@@ -1,9 +1,10 @@
 """MCP Google server — Gmail + Calendar on ONE Google OAuth token, on port 7008.
 
 Supersedes the separate gmail_server (7002) and calendar_server (7001): both sets of tools now
-live here and resolve a single token under the "google" provider key. Destructive ops
-(delete_event, delete_email) are intentionally NOT implemented — those routes are HITL-gated via
-policy.yaml. The helper bodies mirror the original gmail/calendar servers (kept beginner-friendly,
+live here and resolve a single token under the "google" provider key. delete_event is implemented
+but HITL-gated BEFORE execution (orchestrator _APPROVAL_ACTIONS + policy.yaml approval_required_
+actions), so an approved delete never runs unreviewed; delete_email stays intentionally NOT
+implemented. The helper bodies mirror the original gmail/calendar servers (kept beginner-friendly,
 internal helpers rather than new files, per the repo's file-count rule).
 """
 
@@ -224,22 +225,64 @@ async def create_event(user_id: str, summary: str, start: str, end: str,
         return r.json()
 
 
+async def _resolve_event(c, token: str, calendar_id: str, match_summary: str,
+                         time_min: str, time_max: str) -> dict:
+    """Find the one event whose summary matches within [time_min, time_max] and return it.
+
+    Lets callers update an event they can only describe (e.g. "the 1:1 with Rakesh tomorrow")
+    when no event_id is known — the planner is told to pass match_summary + a day window instead
+    of inventing an id (see prompts.py). Returns the full event (id + current times) so the update
+    can clash-check its new window. Raises on a missing window or a no/ambiguous match, so we
+    surface the failure instead of patching the wrong event.
+    """
+    if not (match_summary.strip() and time_min and time_max):
+        raise ValueError("event_id_or_match_summary_window_required")
+    params = {"timeMin": time_min, "timeMax": time_max, "singleEvents": "true",
+              "orderBy": "startTime", "timeZone": _TZ}
+    r = await c.get(f"{_CAL}/calendars/{calendar_id}/events", params=params,
+                    headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    needle = match_summary.strip().lower()
+    matches = [ev for ev in r.json().get("items", []) if needle in ev.get("summary", "").lower()]
+    if len(matches) != 1:
+        raise ValueError(f"no_unique_event_match:{match_summary!r} ({len(matches)} found)")
+    return matches[0]
+
+
+async def _get_event(c, token: str, calendar_id: str, event_id: str) -> dict:
+    """Fetch a single event by id, so a direct-id update can read its current times."""
+    r = await c.get(f"{_CAL}/calendars/{calendar_id}/events/{event_id}",
+                    headers={"Authorization": f"Bearer {token}"})
+    r.raise_for_status()
+    return r.json()
+
+
 @mcp.tool()
-async def update_event(user_id: str, event_id: str, calendar_id: str = "primary",
+async def update_event(user_id: str, event_id: str | None = None, calendar_id: str = "primary",
                        summary: str | None = None, start: str | None = None,
-                       end: str | None = None) -> dict:
-    """Patch a calendar event by id. ``summary``/``start``/``end`` are optional new values.
-    On a clash with the new window, returns a conflict payload for HITL instead of patching.
+                       end: str | None = None, match_summary: str | None = None,
+                       time_min: str | None = None, time_max: str | None = None) -> dict:
+    """Patch an existing calendar event.
+
+    Pass ``event_id`` directly, OR locate the event by ``match_summary`` (distinctive words from
+    the title, e.g. "Rakesh") plus a ``time_min``/``time_max`` window (ISO 8601) bounding the day
+    it falls on, when no id is known. ``summary``/``start``/``end`` are the new values to write
+    (all optional). On a clash with the new window, returns a conflict payload for HITL instead of
+    patching. Args auto-inject user_id.
     """
     token = await resolve_user_token(user_id, _PROVIDER)
     patch = {k: v for k, v in {"summary": summary,
                                "start": start and {"dateTime": start, "timeZone": _TZ},
                                "end": end and {"dateTime": end, "timeZone": _TZ}}.items() if v}
     async with http_client() as c:
-        current = await c.get(f"{_CAL}/calendars/{calendar_id}/events/{event_id}",
-                              headers={"Authorization": f"Bearer {token}"})
-        current.raise_for_status()
-        event = current.json()
+        if event_id is None:
+            event = await _resolve_event(c, token, calendar_id,
+                                         match_summary or "", time_min or "", time_max or "")
+        else:
+            event = await _get_event(c, token, calendar_id, event_id)
+        event_id = event["id"]
+        # start/end may be partial (e.g. extending only the end), so fall back to the event's
+        # current times for the missing side when clash-checking the effective new window.
         new_start = start or event.get("start", {}).get("dateTime")
         new_end = end or event.get("end", {}).get("dateTime")
         if new_start and new_end:
@@ -253,6 +296,34 @@ async def update_event(user_id: str, event_id: str, calendar_id: str = "primary"
         r.raise_for_status()
         log.info("google_event_updated", user_id=user_id)
         return r.json()
+
+@mcp.tool()
+async def delete_event(user_id: str, event_id: str | None = None, calendar_id: str = "primary",
+                       match_summary: str | None = None, time_min: str | None = None,
+                       time_max: str | None = None) -> dict:
+    """Delete a calendar event.
+
+    Pass ``event_id`` directly, or locate it by ``match_summary`` plus a ``time_min``/``time_max``
+    window (ISO 8601) when no id is known. Returns the deleted event's summary + start/end so the
+    confirmation can name the event's ACTUAL date: the planner's time_min is only a SEARCH window
+    (often a whole day or week), so echoing it would show the wrong date.
+    """
+    token = await resolve_user_token(user_id, _PROVIDER)
+    async with http_client() as c:
+        # Fetch the event in BOTH paths so the return carries its real times, not the search window.
+        if event_id is None:
+            event = await _resolve_event(c, token, calendar_id,
+                                         match_summary or "", time_min or "", time_max or "")
+        else:
+            event = await _get_event(c, token, calendar_id, event_id)
+        event_id = event["id"]
+        r = await c.delete(f"{_CAL}/calendars/{calendar_id}/events/{event_id}",
+                           headers={"Authorization": f"Bearer {token}"})
+        r.raise_for_status()
+        log.info("google_event_deleted", user_id=user_id)
+        return {"deleted": event_id, "summary": event.get("summary", ""),
+                "start": event.get("start", {}).get("dateTime"),
+                "end": event.get("end", {}).get("dateTime")}
 
 
 @mcp.tool()
@@ -271,12 +342,23 @@ async def find_free_slot(user_id: str, time_min: str, time_max: str,
 
 
 @mcp.tool()
-async def list_upcoming(user_id: str, calendar_id: str = "primary", max_results: int = 10) -> dict:
-    """List upcoming events. Args: user_id (auto-injected), calendar_id, max_results."""
+async def list_upcoming(user_id: str, calendar_id: str = "primary", max_results: int = 10,
+                        time_min: str | None = None, time_max: str | None = None) -> dict:
+    """List calendar events, soonest first.
+
+    Defaults to events from now onward; pass ``time_min``/``time_max`` (ISO 8601) to scope to a
+    date range — e.g. "what's on my calendar tomorrow" or "events next week". Args auto-inject
+    user_id. (Without these params a date-scoped request couldn't be honoured and the call failed
+    when the planner supplied them.)
+    """
     token = await resolve_user_token(user_id, _PROVIDER)
-    now_rfc3339 = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    # Lower bound defaults to "now" so a bare call lists upcoming events; an explicit time_min
+    # (e.g. the start of a requested day) scopes the list to that range instead.
+    start = time_min or datetime.datetime.now(datetime.timezone.utc).isoformat()
     params = {"maxResults": max_results, "singleEvents": "true", "orderBy": "startTime",
-              "timeMin": now_rfc3339, "timeZone": _TZ}
+              "timeMin": start, "timeZone": _TZ}
+    if time_max:
+        params["timeMax"] = time_max
     async with http_client() as c:
         r = await c.get(f"{_CAL}/calendars/{calendar_id}/events", params=params,
                         headers={"Authorization": f"Bearer {token}"})
