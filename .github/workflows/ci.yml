@@ -96,8 +96,8 @@ jobs:
     env:
       # Minimal env so config.py boots; secrets unused because LLM is mocked.
       JWT_SECRET: {{ secrets.JWT_SECRET }}
-      DATABASE_URL: {{ var.DATABASE_URL }}
-      REDIS_URL: {{ var.REDIS_URL }}
+      DATABASE_URL: {{ vars.DATABASE_URL }}
+      REDIS_URL: {{ vars.REDIS_URL }}
       GROQ_API_KEY: {{ secrets.GROQ_API_KEY }}
     steps:
       - uses: actions/checkout@v5
