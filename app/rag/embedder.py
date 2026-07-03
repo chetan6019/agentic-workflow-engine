@@ -23,11 +23,12 @@ import asyncio
 import hashlib
 import json
 from functools import lru_cache
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 import structlog
 from langchain_core.embeddings import Embeddings
 from langchain_openai import OpenAIEmbeddings
+from pydantic import SecretStr
 from qdrant_client.http.models import SparseVector
 
 from app.config import get_settings
@@ -45,7 +46,8 @@ _BM25_MODEL = "Qdrant/bm25"
 
 def _resolved_provider() -> Provider:
     """Return the configured embedding provider (declared in Settings)."""
-    return get_settings().embedding_provider
+    # Settings types this as a plain str; narrow it back to the Provider literal.
+    return cast(Provider, get_settings().embedding_provider)
 
 
 @lru_cache(maxsize=1)
@@ -74,8 +76,8 @@ def _build_embeddings(provider: Provider) -> Embeddings:
         )
     return OpenAIEmbeddings(
         model="embed",
-        openai_api_base=s.litellm_url,
-        openai_api_key=s.litellm_virtual_key,
+        base_url=s.litellm_url,
+        api_key=SecretStr(s.litellm_virtual_key),
     )
 
 

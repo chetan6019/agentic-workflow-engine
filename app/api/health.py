@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
+from typing import cast
+
 import structlog
 from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
@@ -41,7 +44,9 @@ async def readyz() -> JSONResponse:
         log.error("readyz_postgres_fail", error=str(exc))
 
     try:
-        await get_redis().ping()
+        # redis-py types .ping() as Awaitable[bool] | bool; cast to the awaitable
+        # branch so mypy accepts the await. No-op at runtime.
+        await cast(Awaitable[bool], get_redis().ping())
     except Exception as exc:
         errors.append(f"redis: {exc}")
         log.error("readyz_redis_fail", error=str(exc))

@@ -192,9 +192,9 @@ async def _dense_only_search(
         query_filter=qfilter,
         limit=k,
     )).points
-    plans = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
-             for h in hits]
-    plans = [p for p in plans if p is not None]
+    raw = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
+           for h in hits]
+    plans = [p for p in raw if p is not None]
     log.info("search_timing", mode="dense", total_ms=int((time.monotonic() - t0) * 1000),
              hits=len(plans))
     return plans

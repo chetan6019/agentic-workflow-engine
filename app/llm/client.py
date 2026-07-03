@@ -11,6 +11,7 @@ from langchain_core.messages import BaseMessage
 from langchain_core.outputs import LLMResult
 from langchain_core.runnables import Runnable
 from langchain_openai import ChatOpenAI
+from pydantic import SecretStr
 
 from app.config import get_settings
 from app.core.metrics import llm_call_cost_usd_total, llm_call_tokens_total
@@ -112,8 +113,8 @@ def _base_llm(role: str) -> ChatOpenAI:
     log.debug("llm_client_created", role=role, **cfg)
     return ChatOpenAI(
         model=role,
-        openai_api_base=s.litellm_url,
-        openai_api_key=s.litellm_virtual_key,
+        base_url=s.litellm_url,
+        api_key=SecretStr(s.litellm_virtual_key),
         timeout=30,
         max_retries=0,
         **cfg,
