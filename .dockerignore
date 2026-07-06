@@ -52,3 +52,7 @@ logs/
 
 # ── Old code ─────────────────────────────────────────────────────────────────────
 Old_code/
+
+# ── Web UI build artifacts (rebuilt inside Dockerfile.web) ───────────────────────
+web/node_modules/
+web/dist/
