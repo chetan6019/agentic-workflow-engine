@@ -108,3 +108,54 @@ async def test_retrieve_preserves_rerank_order_over_fused(monkeypatch):
     out = await retriever.retrieve(state)
 
     assert [p.plan_id for p in out] == ["0", "1", "2"]  # rerank order, not fused (4,3,2)
+
+
+class _FakeLangfuse:
+    """Captures create_event calls; optionally raises to test best-effort."""
+
+    def __init__(self, raise_on_event: bool = False) -> None:
+        self.raise_on_event = raise_on_event
+        self.events: list[dict] = []
+
+    def create_event(self, **kwargs):
+        if self.raise_on_event:
+            raise RuntimeError("langfuse down")
+        self.events.append(kwargs)
+
+
+def test_retrieval_event_emitted_with_query_and_kept_docs(monkeypatch):
+    """The Langfuse event carries the search query, kept doc scores, and funnel counts."""
+    monkeypatch.setattr(retriever, "get_settings", lambda: SimpleNamespace(
+        langfuse_public_key="pk", langfuse_secret_key="sk"))
+    fake = _FakeLangfuse()
+    monkeypatch.setattr(retriever, "_langfuse_client", lambda: fake)
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s", user_request="q")
+    fetched = [_plan("a", fused=0.9, sim=0.8), _plan("b", fused=0.4, sim=0.3)]
+
+    retriever._emit_retrieval_event(state, "rewritten q", fetched, fetched[:1], 42)
+
+    assert len(fake.events) == 1
+    event = fake.events[0]
+    assert event["trace_context"] == {"trace_id": "t"}
+    assert event["name"] == "retrieval"
+    assert event["input"] == {"query": "rewritten q"}
+    assert event["output"] == [{"plan_id": "a", "similarity": 0.8, "fused_score": 0.9}]
+    assert event["metadata"]["fetched"] == 2
+    assert event["metadata"]["kept"] == 1
+    assert event["metadata"]["latency_ms"] == 42
+
+
+def test_retrieval_event_is_best_effort(monkeypatch):
+    """A Langfuse failure (or missing keys) never raises out of the emit helper."""
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s", user_request="q")
+
+    # Missing keys (the stubbed namespace has no langfuse_* attrs) → silently skipped.
+    monkeypatch.setattr(retriever, "get_settings", lambda: SimpleNamespace())
+    retriever._emit_retrieval_event(state, "q", [], [], 1)
+
+    # Configured but the client raises → swallowed, not run-fatal.
+    monkeypatch.setattr(retriever, "get_settings", lambda: SimpleNamespace(
+        langfuse_public_key="pk", langfuse_secret_key="sk"))
+    monkeypatch.setattr(retriever, "_langfuse_client",
+                        lambda: _FakeLangfuse(raise_on_event=True))
+    retriever._emit_retrieval_event(state, "q", [], [], 1)

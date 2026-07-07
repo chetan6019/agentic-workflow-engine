@@ -2,8 +2,8 @@
 
 Supersedes the separate gmail_server (7002) and calendar_server (7001): both sets of tools now
 live here and resolve a single token under the "google" provider key. delete_event is implemented
-but HITL-gated BEFORE execution (orchestrator _APPROVAL_ACTIONS + policy.yaml approval_required_
-actions), so an approved delete never runs unreviewed; delete_email stays intentionally NOT
+but HITL-gated BEFORE execution (the orchestrator's _needs_approval reads policy.yaml's
+approval_required_actions), so an approved delete never runs unreviewed; delete_email stays NOT
 implemented. The helper bodies mirror the original gmail/calendar servers (kept beginner-friendly,
 internal helpers rather than new files, per the repo's file-count rule).
 """

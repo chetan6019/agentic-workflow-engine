@@ -15,7 +15,7 @@ from langgraph.graph import END
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.orchestration import graph
 from app.orchestration.nodes import guard
-from app.orchestration.nodes.orchestrator import _topo_levels
+from app.orchestration.nodes.orchestrator import _approval_draft, _needs_approval, _topo_levels
 
 
 def _plan(steps: list[PlanStep] | None = None) -> ExecutionPlan:
@@ -171,3 +171,45 @@ def test_topo_levels_orders_by_dependencies():
 def test_topo_levels_raises_on_cycle():
     with pytest.raises(ValueError, match="cycle_in_plan_steps"):
         _topo_levels([_step("a", ["b"]), _step("b", ["a"])])
+
+
+# ── _needs_approval: the pre-execution HITL gate ─────────────────────────────
+# Regression for the "approve after the write already ran" gap: every tool.action
+# in policy.yaml's approval_required_actions must pause BEFORE execution, not just
+# the two hardcoded delete actions.
+
+
+def _write_step(tool: str, action: str) -> PlanStep:
+    return PlanStep(id="s1", tool=tool, action=action, arguments={})
+
+
+@pytest.mark.parametrize(("tool", "action"), [
+    ("google", "delete_event"),
+    ("google", "delete_email"),
+    ("github", "delete_repo"),
+    ("github", "close_pr"),
+    ("reddit", "post_comment"),
+    ("reddit", "submit"),
+])
+def test_needs_approval_gates_every_policy_action(tool, action):
+    assert _needs_approval([_write_step(tool, action)]) is True
+
+
+def test_needs_approval_lets_reads_through():
+    steps = [_write_step("google", "search_email"), _write_step("finnhub", "get_quote")]
+    assert _needs_approval(steps) is False
+
+
+def test_needs_approval_matches_on_tool_and_action_pair():
+    # "submit" is gated only for reddit — the same action name on another tool
+    # must not trip the gate (policy keys are tool.action pairs, not bare actions).
+    assert _needs_approval([_write_step("finnhub", "submit")]) is False
+
+
+def test_approval_draft_renders_every_gated_write():
+    # The approval card must describe reddit/github writes too, not just calendar
+    # deletes — and must not blow up now that the gate set comes from policy.yaml.
+    steps = [_write_step("reddit", "submit"), _write_step("google", "delete_event")]
+    draft = _approval_draft(_plan(steps))
+    assert "reddit: submit" in draft.summary
+    assert "delete" in draft.summary

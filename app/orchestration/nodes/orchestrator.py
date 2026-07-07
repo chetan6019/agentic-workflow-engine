@@ -16,6 +16,7 @@ from app.core.background import spawn
 from app.core.metrics import node_latency_seconds
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
+from app.guardrails import approval_required_actions
 from app.mcp.client import get_mcp_client
 from app.rag.indexer import index_plan
 from app.rag.retriever import retrieve
@@ -23,21 +24,27 @@ from app.rag.retriever import retrieve
 log = structlog.get_logger(__name__)
 
 # Actions gated for human approval BEFORE they run, so we never approve something that
-# already happened: destructive deletes (always). Updates are NOT pre-gated: an update only
-# pauses when its new time clashes with another event, which the calendar server detects at
-# execution time via the conflict path.
+# already happened. The gated set is policy.yaml's approval_required_actions ("tool.action"
+# keys) — the same list check_destructive enforces post-compose, so there is one source of
+# truth. Updates are NOT pre-gated: an update only pauses when its new time clashes with
+# another event, which the calendar server detects at execution time via the conflict path.
 # STALE (2026-06-23): "send_email" removed from the pre-send approval gate — outbound email
 # sends no longer require HITL (user decision). NOTE: a sent mail can't be unsent, so the agent
 # now sends without review. The recipient-allowlist HITL in output_rules.check_destructive is
 # disabled in tandem (see there). Old set kept per CLAUDE.md R13 — re-add "send_email" to
 # restore the gate.
 # _APPROVAL_ACTIONS = {"delete_event", "delete_page", "send_email"}
-_APPROVAL_ACTIONS = {"delete_event", "delete_page"}
+# STALE (2026-07-05): hardcoded bare-action set superseded by policy.yaml's
+# approval_required_actions — it silently missed reddit/github writes (reddit.submit,
+# reddit.post_comment, github.close_pr, ...), which then executed first and only paused
+# for "approval" afterwards, where a resume would re-run and duplicate the write.
+# _APPROVAL_ACTIONS = {"delete_event", "delete_page"}
 
 
 def _needs_approval(steps: list[PlanStep]) -> bool:
-    """True if any plan step deletes a resource or sends an email (needs pre-approval)."""
-    return any(s.action in _APPROVAL_ACTIONS for s in steps)
+    """True if any plan step is an approval-gated write per policy.yaml (needs pre-approval)."""
+    gated = approval_required_actions()
+    return any(f"{s.tool}.{s.action}" in gated for s in steps)
 
 
 def _conflict_result(results: list[ToolResult]) -> ToolResult | None:
@@ -80,8 +87,9 @@ def _approval_draft(plan: ExecutionPlan) -> DraftResponse:
     are approving before any tool runs — at this point no composed draft exists yet.
     """
     items: list[str] = []
+    gated = approval_required_actions()
     for s in plan.steps:
-        if s.action not in _APPROVAL_ACTIONS:
+        if f"{s.tool}.{s.action}" not in gated:
             continue
         a = s.arguments
         if s.action == "send_email":
@@ -97,7 +105,10 @@ def _approval_draft(plan: ExecutionPlan) -> DraftResponse:
         elif s.action.endswith("_page"):
             target = f'the Notion page "{a.get("title") or a.get("page_id") or "a page"}"'
         else:
-            target = s.action.replace("_", " ")
+            # Generic wording for the other gated writes (reddit.submit,
+            # github.close_pr, ...): "reddit: submit" beats "update submit".
+            items.append(f"{s.tool}: {s.action.replace('_', ' ')}")
+            continue
         items.append(f"{verb} {target}")
     joined = ", and ".join(items) or "the requested change"
     return DraftResponse(

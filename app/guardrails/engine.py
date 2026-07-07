@@ -90,6 +90,16 @@ def _policy() -> _Policy:
     )
 
 
+def approval_required_actions() -> set[str]:
+    """Public view of policy.yaml's approval_required_actions ("tool.action" keys).
+
+    The orchestrator consults this BEFORE executing a plan so every gated write
+    pauses pre-execution; check_destructive re-checks the same set post-compose.
+    One policy list, two enforcement points — keep them reading the same source.
+    """
+    return _policy().approval_actions
+
+
 async def _incr(key: str, amount: int, ttl: int) -> int:
     """INCRBY a counter (TTL on first write); fail-open to 0 on any Redis error."""
     try:

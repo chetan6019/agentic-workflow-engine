@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+from functools import lru_cache
 from typing import Any
 
 import structlog
@@ -65,6 +66,48 @@ class _GraderOutput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     hits: list[_GradedHit] = Field(description="Per-candidate grades.")
+
+
+@lru_cache(maxsize=1)
+def _langfuse_client() -> Any | None:
+    """Lazily build a Langfuse client; None if the SDK or config is unavailable."""
+    try:
+        from langfuse import Langfuse
+
+        return Langfuse()
+    except Exception:
+        return None
+
+
+def _emit_retrieval_event(state: AgentState, query: str, fetched: list[RetrievedPlan],
+                          kept: list[RetrievedPlan], elapsed_ms: int) -> None:
+    """Best-effort: attach a retrieval event to the run's Langfuse trace.
+
+    Without this, Langfuse traces show only the LLM generations — what Qdrant
+    actually returned is invisible, so "bad retrieval vs bad generation" can't be
+    debugged from a trace. Mirrors the guardrails engine's best-effort pattern:
+    skipped when keys aren't configured, never run-fatal.
+    """
+    # getattr: tests stub get_settings() with a minimal namespace lacking these keys.
+    settings = get_settings()
+    if not (getattr(settings, "langfuse_public_key", None)
+            and getattr(settings, "langfuse_secret_key", None)):
+        return
+    client = _langfuse_client()
+    if client is None:
+        return
+    try:
+        client.create_event(
+            trace_context={"trace_id": state.trace_id},
+            name="retrieval",
+            input={"query": query},
+            output=[{"plan_id": p.plan_id, "similarity": round(p.similarity, 3),
+                     "fused_score": round(p.fused_score, 3)} for p in kept],
+            metadata={"collection": _PLANS_COLLECTION, "fetched": len(fetched),
+                      "kept": len(kept), "latency_ms": elapsed_ms},
+        )
+    except Exception as exc:
+        log.debug("retrieve_langfuse_failed", error=str(exc))
 
 
 def _estimate_tokens(plans: list[RetrievedPlan]) -> int:
@@ -297,6 +340,7 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str,
 
 async def retrieve(state: AgentState) -> list[RetrievedPlan]:
     """Run the agentic retrieval loop and return up to 5 graded RetrievedPlans."""
+    t0 = time.monotonic()
     meta = run_metadata(state)
     route = await _route_query(state, meta)
     if not route.should_retrieve:
@@ -328,4 +372,6 @@ async def retrieve(state: AgentState) -> list[RetrievedPlan]:
              post_retrieval_tokens=post_tokens,
              tokens_dropped=pre_tokens - post_tokens,
              fetched=len(fetched), kept=len(kept))
+    _emit_retrieval_event(state, route.query, fetched, kept,
+                          int((time.monotonic() - t0) * 1000))
     return kept

@@ -32,18 +32,29 @@ class Settings(BaseSettings):
     jwt_secret: str
     mcp_calendar_url: str
     mcp_gmail_url: str
-    mcp_notion_url: str
-    mcp_slack_url: str
-    gmail_client_id: str
-    gmail_client_secret: str
+    # STALE (2026-07-06): mcp_notion_url / mcp_slack_url retired — no live code path reads
+    # them. app/mcp/client.py's server map already comments out the "notion"/"slack"
+    # entries (2026-06-22) and docker-compose.yml dropped the mcp-notion/mcp-slack
+    # services the same day; config.py just hadn't caught up. Commented, not deleted,
+    # per CLAUDE.md R13.
+    # mcp_notion_url: str
+    # mcp_slack_url: str
+    # gmail_client_id / gmail_client_secret are no longer mandatory: google_server.py
+    # (via app/mcp/servers/_shared.py) only falls back to these when
+    # google_oauth_client_id/secret are unset, so both can be optional.
+    gmail_client_id: str | None = None
+    gmail_client_secret: str | None = None
 
     # ── Optional / defaulted ─────────────────────────────────────────────────
     streamlit_origin: str = "http://localhost:8501"
+    # React web UI origins (comma-separated; CORS with credentials forbids "*").
+    # Defaults cover the Vite dev server and the nginx-served compose build.
+    web_origins: str = "http://localhost:5173,http://localhost:8502"
     langfuse_public_key: str | None = None
     langfuse_secret_key: str | None = None
     # Embedding client shape. "openai" speaks the OpenAI-compatible API to the
     # LiteLLM proxy (default); "hf" runs sentence-transformers in-process.
-    embedding_provider: str
+    embedding_provider: str = "openai"
     hf_embedding_model: str = "BAAI/bge-base-en-v1.5"
     # IANA zone the calendar tools ask Google to return times in (and to interpret
     # event start/end). Defaults to IST; override with DEFAULT_TZ for other regions.
@@ -71,10 +82,11 @@ class Settings(BaseSettings):
     run_timeout_sec: int = 120
 
     # ── New MCP servers: google / github / reddit / finnhub migration ────────
-    # STALE (2026-06-22) context: the old mcp_{calendar,gmail,notion,slack}_url fields above
-    # stay required and untouched per CLAUDE.md R13. These new fields are OPTIONAL with sane
-    # defaults so the app keeps starting before .env is populated — a tool call fails only when
-    # ITS specific credential is actually missing, not at import time.
+    # STALE (2026-06-22) context: mcp_calendar_url / mcp_gmail_url above stay required for
+    # now (see 2026-07-06 note above for the notion/slack/gmail-creds fields that WERE
+    # retired). These new fields are OPTIONAL with sane defaults so the app keeps starting
+    # before .env is populated — a tool call fails only when ITS specific credential is
+    # actually missing, not at import time.
     mcp_finnhub_url: str = "http://localhost:7005"
     mcp_reddit_url: str = "http://localhost:7006"
     mcp_github_url: str = "http://localhost:7007"

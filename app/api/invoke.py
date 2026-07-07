@@ -9,6 +9,7 @@ from uuid import uuid4
 
 import structlog
 from fastapi import APIRouter, HTTPException, Request
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.config import get_settings
@@ -25,6 +26,7 @@ from app.data.repositories import (
     save_plan,
 )
 from app.orchestration.graph import compile_graph, discard_thread
+from app.security.jwt_tokens import decode_access_token
 
 log = structlog.get_logger(__name__)
 router = APIRouter(prefix="/v1")
@@ -68,6 +70,15 @@ _HISTORY_TURNS = 8
 # original run instead of starting a duplicate).
 _IDEM_KEY = "idem:{user_id}:{key}"
 _IDEM_TTL = 86_400
+# SSE stream tuning: how often the server re-reads the phase key, and how often it
+# sends a comment heartbeat so proxies don't drop an idle connection.
+_SSE_POLL_SEC = 0.5
+_SSE_HEARTBEAT_SEC = 15.0
+
+
+def _sse_event(event: str, data: dict) -> str:
+    """Render one server-sent event frame (event name + JSON data line)."""
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
 
 
 def _phase_label(state: AgentState) -> str:
@@ -244,21 +255,18 @@ async def invoke_phase(trace_id: str, request: Request) -> dict:
     return {"phase": data.get("phase", "pending"), "done": data.get("done", False)}
 
 
-@router.get("/invoke/result/{trace_id}")
-async def invoke_result(trace_id: str, request: Request) -> dict:
-    """Authoritative final state for a trace, read from the persisted plan.
+async def _load_result(trace_id: str, user_id: str) -> dict:
+    """Load a run's result dict — shared by /invoke/result and /invoke/stream.
 
-    Requires a valid JWT and ownership of the run (REVIEW.md R15) — the final state
-    can contain emails and calendar contents. The plan row is written mid-run (before
-    the draft exists, to satisfy the tool_calls FK), so we mark it 'done' once a
-    reliable terminal signal is present: an error, a populated draft, or a guardrails
-    verdict (set only after the graph completes scoring).
+    The plan row is written mid-run (before the draft exists, to satisfy the
+    tool_calls FK), so the run counts as 'done' once a reliable terminal signal
+    is present: an error, a populated draft, or a guardrails verdict (set only
+    after the graph completes scoring).
 
     Reconciliation: if the row exists with no terminal signal AND the phase key
     has vanished, the worker that owned this run is gone (e.g. instance restart);
     report it failed rather than 'pending' forever.
     """
-    user_id = _require_user(request)
     row = await get_plan_by_trace_id(trace_id)
     if not row:
         return {"status": "pending"}
@@ -274,3 +282,75 @@ async def invoke_result(trace_id: str, request: Request) -> dict:
         state["error"] = state.get("error") or "instance_restarted"
         return {"status": "failed", "state": state}
     return {"status": "pending", "state": state}
+
+
+@router.get("/invoke/result/{trace_id}")
+async def invoke_result(trace_id: str, request: Request) -> dict:
+    """Authoritative final state for a trace, read from the persisted plan.
+
+    Requires a valid JWT and ownership of the run (REVIEW.md R15) — the final state
+    can contain emails and calendar contents. Terminal/reconciliation rules live in
+    _load_result, which the SSE stream endpoint shares.
+    """
+    return await _load_result(trace_id, _require_user(request))
+
+
+@router.get("/invoke/stream/{trace_id}")
+async def invoke_stream(trace_id: str, request: Request,
+                        access_token: str | None = None) -> StreamingResponse:
+    """SSE progress stream: `phase` events while the run advances, one `result` event, done.
+
+    The browser's EventSource API cannot send an Authorization header, so the JWT
+    may arrive as ``?access_token=`` instead — decoded with the same validator the
+    auth middleware uses; header auth still works for curl/tests. Trade-off: the
+    token shows up in the URL (and any access log). Acceptable here because tokens
+    are short-lived and logs are local structlog — revisit via ADR if logs ever
+    ship to a third party.
+
+    The Streamlit UI keeps polling /invoke/phase + /invoke/result; this endpoint
+    exists for the React UI (architecture v8: "Streaming is SSE").
+    """
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id and access_token:
+        user_id = decode_access_token(access_token)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="unauthenticated")
+
+    # Already terminal (or the phase key expired after completion): reply with a
+    # one-event stream instead of polling for a phase that will never change.
+    # Raises the same 404 as /invoke/result when the run belongs to someone else.
+    first = await _load_result(trace_id, user_id)
+
+    async def _generate():
+        if first["status"] != "pending":
+            yield _sse_event("result", first)
+            return
+        deadline = time.monotonic() + get_settings().run_timeout_sec + 30
+        last_phase: str | None = None
+        last_beat = time.monotonic()
+        while time.monotonic() < deadline:
+            raw = await get_redis().get(_PHASE_KEY.format(trace_id=trace_id))
+            if raw:
+                data = json.loads(raw)
+                # Same ownership rule as /invoke/phase: the owner rides in the key.
+                if data.get("owner") and data["owner"] != user_id:
+                    yield _sse_event("error", {"detail": "not_found"})
+                    return
+                phase = data.get("phase", "pending")
+                if phase != last_phase:
+                    last_phase = phase
+                    last_beat = time.monotonic()
+                    yield _sse_event("phase", {"phase": phase, "done": data.get("done", False)})
+                if data.get("done"):
+                    yield _sse_event("result", await _load_result(trace_id, user_id))
+                    return
+            if time.monotonic() - last_beat >= _SSE_HEARTBEAT_SEC:
+                last_beat = time.monotonic()
+                yield ": ping\n\n"  # comment frame keeps proxies from idling the stream out
+            await asyncio.sleep(_SSE_POLL_SEC)
+        yield _sse_event("error", {"detail": "stream_timeout"})
+
+    # X-Accel-Buffering tells nginx (the React app's prod proxy) not to buffer SSE.
+    return StreamingResponse(_generate(), media_type="text/event-stream",
+                             headers={"Cache-Control": "no-cache",
+                                      "X-Accel-Buffering": "no"})

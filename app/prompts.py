@@ -489,6 +489,9 @@ NEVER:
 Output ONLY valid json, no prose, matching exactly:
 {"summary": "string", "detail_markdown": "string", "actions_taken": ["string"],
  "actions_pending": ["string"], "citations": ["string"]}
+`citations` may ONLY contain http(s) URLs that literally appear in the tool
+results. It is almost always an empty list. NEVER put step ids ("s1"), tool
+names, or any internal identifier in `citations`.
 </output_format>"""
 
 def build_composer_messages(plan: Any, tool_results: list[Any], preferences: list[Any],

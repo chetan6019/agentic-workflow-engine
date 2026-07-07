@@ -165,6 +165,37 @@ async def _run_metrics(rows: list[dict[str, Any]]) -> dict[str, float]:
     return _scores_from_result(result, names)
 
 
+def _push_scores_to_langfuse(scores: dict[str, float], sha: str, n: int) -> None:
+    """Best-effort: mirror the aggregate RAGAS scores to Langfuse, tagged by git sha.
+
+    Creates one 'ragas-eval' trace per eval run and attaches each metric as a
+    ragas_<name> score, so faithfulness / context_precision trends are visible
+    across commits in the Langfuse UI next to production traces. The CI gate and
+    the JSON artifact stay the source of truth; a missing Langfuse config (e.g.
+    a fork PR without secrets) just skips the push.
+    """
+    if not (os.environ.get("LANGFUSE_PUBLIC_KEY") and os.environ.get("LANGFUSE_SECRET_KEY")):
+        return
+    try:
+        from langfuse import Langfuse
+
+        client = Langfuse()
+        trace_id = client.create_trace_id()
+        client.create_event(
+            trace_context={"trace_id": trace_id},
+            name="ragas-eval",
+            input={"git_sha": sha, "rows": n, "thresholds": THRESHOLDS},
+            output=scores,
+        )
+        for name, value in scores.items():
+            client.create_score(name=f"ragas_{name}", value=value, trace_id=trace_id,
+                                metadata={"git_sha": sha, "rows": n})
+        client.flush()
+        print(f"Langfuse: pushed {len(scores)} score(s) for {sha}")
+    except Exception as exc:
+        print(f"Langfuse push skipped: {exc}")
+
+
 def _print_table(scores: dict[str, float]) -> None:
     """Print a markdown score table with pass/fail against the gated thresholds."""
     print("\n| metric | score | threshold | gated | pass |")
@@ -208,6 +239,7 @@ async def _amain(args: argparse.Namespace) -> int:
 
     scores = await _run_metrics(rows)
     report = _write_report(scores, sha, len(rows), dry_run=False)
+    _push_scores_to_langfuse(scores, sha, len(rows))
     _print_table(scores)
     passed = _gate(scores)
     print(f"\nReport written to {report}")

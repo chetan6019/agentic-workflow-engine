@@ -106,9 +106,13 @@ def create_app() -> FastAPI:
     # (Starlette runs middleware outermost-first; last added is outermost).
     app.add_middleware(RequestDurationMiddleware)
 
+    # Streamlit origin plus the React web UI origins (comma-separated setting).
+    # In prod the React app is same-origin behind its nginx proxy, so CORS mostly
+    # matters for the Vite dev server hitting :8000 directly.
+    origins = [s.streamlit_origin] + [o.strip() for o in s.web_origins.split(",") if o.strip()]
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=[s.streamlit_origin],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
