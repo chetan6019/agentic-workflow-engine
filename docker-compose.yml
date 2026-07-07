@@ -259,6 +259,18 @@ services:
     restart: on-failure
     depends_on: [api]
 
+  # React web UI (Vite build served by nginx, which also proxies /v1 → api).
+  # Runs alongside Streamlit during the migration; 3000 is Grafana, 8501 is
+  # Streamlit, so the SPA takes 8502.
+  web:
+    build: { context: ., dockerfile: infra/Dockerfile.web }
+    init: true
+    ports: ["8502:80"]
+    environment:
+      TZ: ${TZ:-UTC}
+    restart: on-failure
+    depends_on: [api]
+
   # ── Observability: metrics time-series + dashboards ──────────────────────────
   # Prometheus scrapes the app's /metrics (RED latency + guardrail counters) and the
   # LiteLLM proxy's /metrics (spend/tokens). Grafana visualizes both. See infra/prometheus.yml

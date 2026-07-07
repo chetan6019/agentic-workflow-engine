@@ -71,6 +71,15 @@ mypy_path = "."
 module = ["jose.*", "yaml"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# langchain_huggingface lives in requirements-hf.txt (optional, EMBEDDING_PROVIDER=hf
+# only), so CI's typecheck job never installs it — the single import site in
+# app/rag/embedder.py needs to stay untyped instead of failing as missing. The bare
+# "langchain_huggingface" entry (no wildcard) is required for `from langchain_huggingface
+# import ...` itself — "langchain_huggingface.*" alone only matches its submodules.
+module = ["langchain_huggingface", "langchain_huggingface.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
