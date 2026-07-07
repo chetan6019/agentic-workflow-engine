@@ -40,8 +40,11 @@ permissions:
 
 env:
   PYTHON_VERSION: "3.13"
-  REGISTRY: ghcr.io
-  IMAGE_PREFIX: ${{ github.repository }}      # ghcr.io/<owner>/<repo>-<service>
+  REGISTRY: docker.io
+  # Docker Hub namespace (username or org) — set as a repo variable (Settings > Secrets
+  # and variables > Actions > Variables). Auth token is DOCKERHUB_TOKEN (a repo secret,
+  # Docker Hub access token, not your account password).
+  IMAGE_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}   # docker.io/<namespace>/agentic-workflow-engine-<service>
   # Coverage floor. Ratchet up as the codebase matures; target is 85.
   COVERAGE_MIN: "60"
 
@@ -159,7 +162,7 @@ jobs:
           retention-days: 7
 
   # Build each real image, Trivy-scan it in the same job (no artifact dance),
-  # and push to GHCR only on main pushes. The four MCP servers share the "mcp"
+  # and push to Docker Hub only on main pushes. The four MCP servers share the "mcp"
   # image — docker-compose runs it with a different command per server.
   build-scan-publish:
     name: Image ${{ matrix.service }}
@@ -167,8 +170,7 @@ jobs:
     timeout-minutes: 25
     needs: [tests, web]
     permissions:
-      contents: read
-      packages: write               # only used by the main-branch push step
+      contents: read               # Docker Hub auth uses DOCKERHUB_TOKEN, not GITHUB_TOKEN
     strategy:
       fail-fast: false
       matrix:
@@ -221,19 +223,18 @@ jobs:
           exit-code: "1"            # fail the job on CRITICAL/HIGH findings
           vuln-type: os,library
 
-      - name: Log in to GHCR
+      - name: Log in to Docker Hub
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: docker/login-action@v3
         with:
-          registry: ${{ env.REGISTRY }}
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
 
       - name: Push sha + latest tags
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         run: |
-          # GHCR requires a lowercase repository path.
-          IMAGE="${REGISTRY}/$(echo "${IMAGE_PREFIX}" | tr '[:upper:]' '[:lower:]')-${{ matrix.service }}"
+          # Docker Hub requires a lowercase repository path, same as any registry.
+          IMAGE="${REGISTRY}/$(echo "${IMAGE_PREFIX}" | tr '[:upper:]' '[:lower:]')/agentic-workflow-engine-${{ matrix.service }}"
           docker tag "ci-${{ matrix.service }}:scan" "${IMAGE}:sha-${GITHUB_SHA::7}"
           docker tag "ci-${{ matrix.service }}:scan" "${IMAGE}:latest"
           docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
