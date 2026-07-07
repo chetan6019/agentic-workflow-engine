@@ -41,6 +41,11 @@ def _approval(hours: float = 1.0) -> dict:
             "expires_at": datetime.now(timezone.utc) + timedelta(hours=hours)}
 
 
+# A request with no authenticated caller — ownership enforcement is skipped, so
+# these endpoint-level tests exercise the decision logic, not the cross-user gate.
+_REQ = SimpleNamespace(state=SimpleNamespace(user_id=None))
+
+
 @pytest.fixture
 def wired(monkeypatch):
     """Wire submit_approval's collaborators to fakes; returns the recorder."""
@@ -82,14 +87,14 @@ def wired(monkeypatch):
 async def test_unknown_token_is_404(wired):
     wired.approval = None
     with pytest.raises(HTTPException) as exc:
-        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"))
+        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"), _REQ)
     assert exc.value.status_code == 404
 
 
 async def test_expired_token_is_410(wired):
     wired.approval = _approval(hours=-1)
     with pytest.raises(HTTPException) as exc:
-        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"))
+        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"), _REQ)
     assert exc.value.status_code == 410
 
 
@@ -99,7 +104,7 @@ async def test_missing_plan_row_is_404(wired, monkeypatch):
 
     monkeypatch.setattr(approvals, "get_plan_by_trace_id", no_plan)
     with pytest.raises(HTTPException) as exc:
-        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"))
+        await approvals.submit_approval("tok", ApprovalRequest(decision="approve"), _REQ)
     assert exc.value.status_code == 404
 
 
@@ -108,7 +113,7 @@ async def test_missing_plan_row_is_404(wired, monkeypatch):
 
 async def test_reject_persists_error_and_never_resumes_graph(wired):
     wired.state = _state(requires_approval=True, approval_token="tok")
-    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="reject"))
+    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="reject"), _REQ)
     assert resp.status == "rejected"
     assert wired.invoked == []  # graph must NOT run on reject
     saved = wired.saved[-1]
@@ -119,14 +124,14 @@ async def test_reject_persists_error_and_never_resumes_graph(wired):
 
 async def test_edit_without_draft_is_400(wired):
     with pytest.raises(HTTPException) as exc:
-        await approvals.submit_approval("tok", ApprovalRequest(decision="edit"))
+        await approvals.submit_approval("tok", ApprovalRequest(decision="edit"), _REQ)
     assert exc.value.status_code == 400
 
 
 async def test_edit_replaces_draft_and_resumes(wired):
     wired.state = _state(draft=_draft("old"), requires_approval=True)
     resp = await approvals.submit_approval(
-        "tok", ApprovalRequest(decision="edit", edited_draft=_draft("edited")))
+        "tok", ApprovalRequest(decision="edit", edited_draft=_draft("edited")), _REQ)
     assert resp.status == "resumed"
     resumed = wired.invoked[0]
     assert resumed.draft is not None and resumed.draft.summary == "edited"
@@ -148,7 +153,7 @@ async def test_approve_rebooks_calendar_conflict(wired):
         plan=_plan("s1", start="2026-06-15T11:00:00+05:30", end="2026-06-15T11:30:00+05:30"),
         tool_results=[conflict], draft=_draft(), requires_approval=True, approval_token="tok",
     )
-    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="approve"))
+    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="approve"), _REQ)
     assert resp.status == "resumed"
     resumed = wired.invoked[0]
     step = resumed.plan.steps[0]
@@ -163,7 +168,7 @@ async def test_approve_rebooks_calendar_conflict(wired):
 
 async def test_approve_without_conflict_resumes_unchanged(wired):
     wired.state = _state(plan=_plan("s1"), requires_approval=True, approval_token="tok")
-    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="approve"))
+    resp = await approvals.submit_approval("tok", ApprovalRequest(decision="approve"), _REQ)
     assert resp.status == "resumed"
     resumed = wired.invoked[0]
     assert resumed.requires_approval is False

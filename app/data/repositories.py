@@ -8,12 +8,13 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import structlog
-from sqlalchemy import select, update
+from sqlalchemy import delete, select, update
 
 from app.core.state import AgentState, ToolResult
 from app.data.db import get_async_session
 from app.data.models import (
     Approval,
+    AuditLog,
     Feedback,
     IntegrationToken,
     Message,
@@ -80,8 +81,10 @@ async def rename_session(session_id: str, user_id: str, title: str) -> bool:
         result = await s.execute(
             update(Session).where(Session.id == session_id, Session.user_id == user_id).values(title=title)
         )
-        log.info("session_renamed", session_id=session_id, ok=result.rowcount > 0)
-        return result.rowcount > 0
+        rowcount: int = getattr(result, "rowcount", 0) or 0
+        renamed = rowcount > 0
+        log.info("session_renamed", session_id=session_id, ok=renamed)
+        return renamed
 
 
 async def save_message(session_id: str, role: str, content: str) -> None:
@@ -178,11 +181,29 @@ async def update_approval_status(token: str, decision: str) -> None:
         log.info("approval_updated", token=token[:8] + "…", decision=decision)
 
 
+async def get_pending_approvals_by_user(user_id: str) -> list[dict[str, Any]]:
+    """Return undecided approvals for the user's own runs (joined via plans.user_id)."""
+    async with get_async_session() as s:
+        rows = (await s.execute(
+            select(Approval).join(Plan, Approval.trace_id == Plan.trace_id)
+            .where(Plan.user_id == user_id, Approval.decision.is_(None))
+        )).scalars().all()
+        return [{"token": r.token, "trace_id": r.trace_id,
+                 "expires_at": r.expires_at, "decision": r.decision} for r in rows]
+
+
 async def save_feedback(trace_id: str, score: int, comment: str | None = None) -> None:
     """Persist user feedback for a completed run."""
     async with get_async_session() as s:
         s.add(Feedback(trace_id=trace_id, score=score, comment=comment))
         log.info("feedback_saved", trace_id=trace_id, score=score)
+
+
+async def save_audit(user_id: str, action: str, detail: str | None = None) -> None:
+    """Append an immutable audit-trail entry (used by guardrail blocks)."""
+    async with get_async_session() as s:
+        s.add(AuditLog(user_id=user_id, action=action, detail=detail))
+        log.info("audit_logged", user_id=user_id, action=action)
 
 
 async def save_token(user_id: str, provider: str, token_enc: str) -> None:
@@ -208,3 +229,21 @@ async def get_user_providers(user_id: str) -> list[str]:
     async with get_async_session() as s:
         rows = (await s.execute(select(IntegrationToken.provider).where(IntegrationToken.user_id == user_id))).scalars().all()
         return list(rows)
+
+
+async def get_user_tokens(user_id: str) -> list[dict[str, Any]]:
+    """Return the user's integration rows as {provider, token_enc} for status checks."""
+    async with get_async_session() as s:
+        rows = (await s.execute(
+            select(IntegrationToken).where(IntegrationToken.user_id == user_id))).scalars().all()
+        return [{"provider": r.provider, "token_enc": r.token_enc} for r in rows]
+
+
+async def delete_token(user_id: str, provider: str) -> bool:
+    """Delete a user's provider token row; return True if a row was removed."""
+    async with get_async_session() as s:
+        result = await s.execute(delete(IntegrationToken).where(
+            IntegrationToken.user_id == user_id, IntegrationToken.provider == provider))
+        removed = (getattr(result, "rowcount", 0) or 0) > 0
+        log.info("token_deleted", user_id=user_id, provider=provider, removed=removed)
+        return removed

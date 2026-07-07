@@ -8,6 +8,7 @@ Run migrations with ``alembic upgrade head``. The URL comes from app settings
 from __future__ import annotations
 
 import asyncio
+import logging
 from logging.config import fileConfig
 
 from alembic import context
@@ -17,7 +18,12 @@ from app.config import get_settings
 from app.data.models import Base
 
 config = context.config
-if config.config_file_name is not None:
+# Configure logging from alembic.ini ONLY when alembic runs standalone (CLI).
+# When the API invokes migrations in-process at startup (init_db), the root
+# logger already carries structlog's JSON handler — fileConfig would REPLACE it
+# and raise the root level to WARNING (alembic.ini [logger_root]), silently
+# killing every app INFO log for the life of the process.
+if config.config_file_name is not None and not logging.getLogger().handlers:
     fileConfig(config.config_file_name)
 
 target_metadata = Base.metadata

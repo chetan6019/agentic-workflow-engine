@@ -1,34 +1,241 @@
+# ──────────────────────────────────────────────────────────────────────────────
+# CI for agentic-workflow-engine
+#
+# Pipeline (jobs run in parallel unless `needs:` says otherwise):
+#   lint / typecheck / secrets-scan   → tests (one pytest run, coverage gate)
+#                                     → build-scan-publish (matrix: one job per
+#                                       real image; Trivy scans in-job; pushes
+#                                       to GHCR on main pushes only)
+#
+# Conventions: bare pip + pytest, no Testcontainers, all upstreams mocked.
+# RAGAS eval lives in .github/workflows/eval-ragas.yml.
+#
+# STALE (2026-07-03): the previous 9-job pipeline (unit/integration/e2e as
+# separate jobs; build→artifact→scan→publish as three matrix jobs over
+# [api, ui, mcp-google, mcp-github, mcp-reddit, mcp-finnhub]) was retired here
+# rather than commented in place — it referenced infra/docker/*.Dockerfile
+# paths that never existed, so every image job had silently skipped since day
+# one. The real Dockerfiles are infra/Dockerfile.{base,api,streamlit,mcp}; the
+# four MCP servers share ONE image (Dockerfile.mcp, different commands), and
+# every service image builds FROM workflow-base, which must be built first.
+# Full old structure is preserved in git history (per CLAUDE.md R13 intent).
+# ──────────────────────────────────────────────────────────────────────────────
+
 name: CI
 
 on:
   push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Cancel superseded runs on the same branch to save minutes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+# Least-privilege defaults. Individual jobs widen as needed.
+permissions:
+  contents: read
+
+env:
+  PYTHON_VERSION: "3.13"
+  REGISTRY: docker.io
+  # Docker Hub namespace (username or org) — set as a repo variable (Settings > Secrets
+  # and variables > Actions > Variables). Auth token is DOCKERHUB_TOKEN (a repo secret,
+  # Docker Hub access token, not your account password).
+  IMAGE_PREFIX: ${{ vars.DOCKERHUB_USERNAME }}   # docker.io/<namespace>/agentic-workflow-engine-<service>
+  # Coverage floor. Ratchet up as the codebase matures; target is 85.
+  COVERAGE_MIN: "60"
 
 jobs:
-  ci:
+  lint:
+    name: Lint (ruff)
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 5
     steps:
       - uses: actions/checkout@v5
-
       - uses: actions/setup-python@v6
         with:
-          python-version: "3.13"
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
+      - run: pip install ruff
+      - run: ruff check app/ streamlit_app/ scripts/ tests/
+      # STALE (2026-07-06): format gate disabled — the repo's ~75 files use a
+      # compact hand-formatted style that ruff format would fully rewrap, so
+      # this check failed on every PR. CLAUDE.md's quality gates are ruff check
+      # + mypy only. Re-enable only after a dedicated repo-wide `ruff format`
+      # commit adopts the formatter's style.
+      # - run: ruff format --check app/ streamlit_app/ scripts/ tests/
 
-      - name: Install dependencies
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt mypy
+      - run: mypy app/
+
+  # React web UI: typecheck + production build (vitest slot reserved for when
+  # component tests land). Runs in parallel with the Python jobs.
+  web:
+    name: Web UI (typecheck + build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-fund --no-audit
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+
+  secrets-scan:
+    name: Secrets scan (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0              # gitleaks scans full history
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # One pytest run covers unit, API-route, and e2e suites — they all use the
+  # same mocked upstreams and the same deps, so splitting them into chained
+  # jobs only tripled the install time without adding isolation.
+  tests:
+    name: Tests (+ coverage gate)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    needs: [lint, typecheck]
+    env:
+      # Enough env so config.py's Settings boots; every upstream is mocked, so values are
+      # dummy/unreachable except FERNET_KEY, which must be a real Fernet key because
+      # tests/api/test_integrations.py round-trips a real encrypt/decrypt through it.
+      # mcp_notion_url / mcp_slack_url / gmail_client_id / gmail_client_secret /
+      # embedding_provider are NOT listed here — config.py made them optional (2026-07-06).
+      JWT_SECRET: ${{ secrets.JWT_SECRET }}
+      DATABASE_URL: ${{ vars.DATABASE_URL }}
+      REDIS_URL: ${{ vars.REDIS_URL }}
+      GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
+      QDRANT_URL: ${{ secrets.QDRANT_URL }}
+      LITELLM_URL: ${{ secrets.LITELLM_URL }}
+      LITELLM_VIRTUAL_KEY: ${{ secrets.LITELLM_VIRTUAL_KEY }}
+      FERNET_KEY: ${{ secrets.FERNET_KEY }}
+      MCP_CALENDAR_URL: ${{ secrets.MCP_CALENDAR_URL }}
+      MCP_GMAIL_URL: ${{ secrets.MCP_GMAIL_URL }}
+      MCP_GITHUB_URL: ${{ secrets.MCP_GITHUB_URL }}
+      MCP_REDDIT_URL: ${{ secrets.MCP_REDDIT_URL }}
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt pytest pytest-cov pytest-asyncio httpx respx
+      - name: Run test suite
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt ruff mypy
+          pytest tests/ \
+            --ignore=tests/eval \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            --cov-fail-under=${{ env.COVERAGE_MIN }} \
+            -q
+      - name: Upload coverage report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml
+          path: coverage.xml
+          retention-days: 7
 
-      - name: Lint (ruff)
-        run: ruff check app/ streamlit_app/ scripts/ tests/
+  # Build each real image, Trivy-scan it in the same job (no artifact dance),
+  # and push to Docker Hub only on main pushes. The four MCP servers share the "mcp"
+  # image — docker-compose runs it with a different command per server.
+  build-scan-publish:
+    name: Image ${{ matrix.service }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    needs: [tests, web]
+    permissions:
+      contents: read               # Docker Hub auth uses DOCKERHUB_TOKEN, not GITHUB_TOKEN
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - service: api
+            dockerfile: infra/Dockerfile.api
+          - service: streamlit
+            dockerfile: infra/Dockerfile.streamlit
+          - service: mcp
+            dockerfile: infra/Dockerfile.mcp
+          - service: web
+            dockerfile: infra/Dockerfile.web
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
 
-      # R5 landed (config.py is now plain typed fields), but the rest of app/ is
-      # not yet fully mypy-clean. Keep advisory until a clean `mypy app/` pass,
-      # then flip to gating.
-      - name: Type check (mypy, advisory)
-        run: mypy app/
-        continue-on-error: true
+      # Every Python service image builds FROM workflow-base:latest, so build
+      # the base first (web is node+nginx and skips it). The gha cache (shared
+      # scope) makes repeats near-instant.
+      - name: Build base image
+        if: matrix.service != 'web'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: infra/Dockerfile.base
+          push: false
+          load: true
+          tags: workflow-base:latest
+          cache-from: type=gha,scope=base
+          cache-to: type=gha,scope=base,mode=max
 
-      - name: Tests (pytest)
-        run: pytest -q
+      - name: Build ${{ matrix.service }} image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          push: false
+          load: true
+          tags: ci-${{ matrix.service }}:scan
+          cache-from: type=gha,scope=${{ matrix.service }}
+          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ci-${{ matrix.service }}:scan
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"            # fail the job on CRITICAL/HIGH findings
+          vuln-type: os,library
+
+      - name: Log in to Docker Hub
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: docker/login-action@v3
+        with:
+          username: ${{ vars.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Push sha + latest tags
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        run: |
+          # Docker Hub requires a lowercase repository path, same as any registry.
+          IMAGE="${REGISTRY}/$(echo "${IMAGE_PREFIX}" | tr '[:upper:]' '[:lower:]')/agentic-workflow-engine-${{ matrix.service }}"
+          docker tag "ci-${{ matrix.service }}:scan" "${IMAGE}:sha-${GITHUB_SHA::7}"
+          docker tag "ci-${{ matrix.service }}:scan" "${IMAGE}:latest"
+          docker push "${IMAGE}:sha-${GITHUB_SHA::7}"
+          docker push "${IMAGE}:latest"

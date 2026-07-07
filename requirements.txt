@@ -4,7 +4,7 @@
 fastapi
 uvicorn[standard]
 streamlit
-httpx
+httpx2
 pydantic
 pydantic-settings
 
@@ -13,13 +13,15 @@ langchain
 langgraph
 langchain-openai
 langchain-mcp-adapters
-# Local-embeddings extras (only needed when EMBEDDING_PROVIDER=hf — pulls in torch,
-# ~2-3GB). Default path uses the LiteLLM proxy, so these are left out of the image.
-# langchain-huggingface
-# sentence-transformers
+# Local-embeddings extras (langchain-huggingface, sentence-transformers, torch) live in
+# requirements-hf.txt, not here — only needed when EMBEDDING_PROVIDER=hf (default is
+# "openai" via the LiteLLM proxy). Keeping the ~2-3GB torch download out of the base
+# install means CI/Docker builds never touch PyTorch's CDN, which has intermittent SSL
+# handshake failures on some networks/runners.
 
 # MCP servers
 fastmcp
+PyGithub
 
 # Data stores
 sqlalchemy[asyncio]
@@ -28,8 +30,9 @@ redis
 qdrant-client
 # Schema migrations (alembic upgrade head); see alembic/ and app/data/db.py.
 alembic
-# BM25 sparse vectors for hybrid (dense+sparse) retrieval. Pure-lexical, CPU-only,
-# not an LLM embedding — so it does not violate the LiteLLM-only embedding rule.
+# BM25 sparse vectors for hybrid (dense+sparse) retrieval, and the cross-encoder
+# reranker (RERANK_ENABLED). Both pure-CPU, not LLM embeddings — so neither violates
+# the LiteLLM-only embedding rule.
 fastembed
 
 # Security
@@ -50,3 +53,6 @@ tzdata
 # Dev / testing
 pytest
 pytest-asyncio
+
+prometheus-client
+litellm==1.89.0

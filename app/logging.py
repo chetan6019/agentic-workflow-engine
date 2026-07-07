@@ -6,11 +6,14 @@ import logging
 import sys
 
 import structlog
+from structlog.typing import Processor
 
 
 def configure_logging(level: str = "INFO") -> None:
     """Configure structlog for JSON output to stdout."""
-    shared_processors = [
+    # Annotated so mypy sees a homogeneous processor list (else it widens the mixed
+    # callables/instances to list[object] and rejects it at configure/formatter).
+    shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,

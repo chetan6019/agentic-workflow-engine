@@ -37,6 +37,13 @@ dependencies = [
     # Utilities
     "tenacity",
     "tzdata",
+    "pytest>=9.1.0",
+    "prometheus-client>=0.25.0",
+    "pytest-asyncio>=1.4.0",
+    "langchain-huggingface>=1.2.2",
+    "sentence-transformers>=5.6.0",
+    "pygithub>=2.9.1",
+    "httpx2>=2.5.0",
 ]
 
 [project.optional-dependencies]
@@ -44,6 +51,10 @@ dependencies = [
 # the default 'openai' provider routes through LiteLLM and needs neither.
 hf = ["langchain-huggingface", "sentence-transformers"]
 dev = ["pytest", "pytest-asyncio", "respx", "ruff", "mypy"]
+eval = [
+    "datasets>=5.0.0",
+    "ragas>=0.4.3",
+]
 
 [tool.mypy]
 # The package has no __init__.py files (namespace-style layout), so without
@@ -54,9 +65,30 @@ explicit_package_bases = true
 namespace_packages = true
 mypy_path = "."
 
+[[tool.mypy.overrides]]
+# python-jose and PyYAML ship no inline types and CI installs no stub packages
+# (`pip install -r requirements.txt mypy`), so treat these third-party imports as
+# untyped instead of failing the typecheck job on a missing-stubs error.
+module = ["jose.*", "yaml"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+# langchain_huggingface lives in requirements-hf.txt (optional, EMBEDDING_PROVIDER=hf
+# only), so CI's typecheck job never installs it — the single import site in
+# app/rag/embedder.py needs to stay untyped instead of failing as missing. The bare
+# "langchain_huggingface" entry (no wildcard) is required for `from langchain_huggingface
+# import ...` itself — "langchain_huggingface.*" alone only matches its submodules.
+module = ["langchain_huggingface", "langchain_huggingface.*"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 # Put the repo root on sys.path so `import app` works under the bare `pytest`
 # console script in CI (which, unlike `python -m pytest`, does not add cwd).
 pythonpath = ["."]
+
+[dependency-groups]
+dev = [
+    "types-pyyaml>=6.0.12.20260518",
+]

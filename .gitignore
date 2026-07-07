@@ -1,3 +1,7 @@
+# ── Web UI (React/Vite) ─────────────────────────────────────────────────────────
+web/node_modules/
+web/dist/
+
 # ── Python ─────────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
@@ -76,3 +80,11 @@ Thumbs.db
 
 # ── Old code (kept locally, never committed) ────────────────────────────────────
 Old_code/
+Files_not_to_push_to_github/
+artifacts/
+app/ORIG_prompts.py
+BUILD_STEPS.md
+PROMPT_*.md
+GENERATION_PROMPT.md
+docs/
+CLAUDE.md

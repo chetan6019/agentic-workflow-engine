@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Awaitable
+from typing import cast
+
 import structlog
-from fastapi import APIRouter
+from fastapi import APIRouter, Response
 from fastapi.responses import JSONResponse
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 from sqlalchemy import text
 
 from app.data.db import get_engine
@@ -21,6 +25,12 @@ async def healthz() -> dict:
     return {"status": "ok"}
 
 
+@router.get("/metrics")
+async def metrics() -> Response:
+    """Prometheus scrape endpoint exposing the default registry (guardrail counters)."""
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
 @router.get("/readyz")
 async def readyz() -> JSONResponse:
     """Readiness probe — checks Postgres, Redis, and Qdrant connectivity."""
@@ -34,7 +44,9 @@ async def readyz() -> JSONResponse:
         log.error("readyz_postgres_fail", error=str(exc))
 
     try:
-        await get_redis().ping()
+        # redis-py types .ping() as Awaitable[bool] | bool; cast to the awaitable
+        # branch so mypy accepts the await. No-op at runtime.
+        await cast(Awaitable[bool], get_redis().ping())
     except Exception as exc:
         errors.append(f"redis: {exc}")
         log.error("readyz_redis_fail", error=str(exc))

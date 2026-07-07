@@ -45,22 +45,22 @@ services:
     # healthcheck pinning the service "unhealthy" is worse than none). The app
     # tolerates a not-yet-ready qdrant — retrieval failures are best-effort.
 
-  tei:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
-    command: ["--model-id", "BAAI/bge-base-en-v1.5", "--port", "80"]
-    ports: ["8080:80"]
-    volumes: ["teidata:/data"]
-    environment:
-      HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
-      interval: 15s
-      timeout: 5s
-      retries: 10
-      start_period: 60s
+  # tei:
+  #   image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9
+  #   command: ["--model-id", "BAAI/bge-base-en-v1.5", "--port", "80"]
+  #   ports: ["8080:80"]
+  #   volumes: ["teidata:/data"]
+  #   environment:
+  #     HUGGING_FACE_HUB_TOKEN: ${HF_TOKEN}
+  #   healthcheck:
+  #     test: ["CMD", "wget", "--spider", "-q", "http://localhost:80/health"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 10
+  #     start_period: 60s
 
   litellm-proxy:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:main-stable
     command: ["--config", "/config.yaml", "--port", "4000"]
     ports: ["4000:4000"]
     volumes: ["./infra/litellm_config.yaml:/config.yaml:ro"]
@@ -77,63 +77,133 @@ services:
       REDIS_URL: redis://redis:6379/1
       # DEBUG dumps full request/response blobs on every call — keep INFO unless
       # actively debugging LiteLLM internals.
-      LITELLM_LOG: INFO
-    depends_on: [postgres, redis, tei]
+      LITELLM_LOG: DEBUG
+    depends_on: [postgres, redis]
 
-  mcp-calendar:
+  # STALE (2026-06-22): the four service blocks below (mcp-calendar/gmail/notion/slack) are
+  # superseded by the google/github/reddit/finnhub services further down. Commented out — not
+  # deleted — per CLAUDE.md R13. A later cleanup PR sweeps these.
+  # mcp-calendar:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.calendar_server"]
+  #   ports: ["7001:7001"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7001)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-gmail:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.gmail_server"]
+  #   ports: ["7002:7002"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7002)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-notion:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.notion_server"]
+  #   ports: ["7003:7003"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7003)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # mcp-slack:
+  #   build: { context: ., dockerfile: infra/Dockerfile.mcp }
+  #   init: true
+  #   command: ["python", "-m", "app.mcp.servers.slack_server"]
+  #   ports: ["7004:7004"]
+  #   env_file: .env
+  #   restart: on-failure
+  #   healthcheck:
+  #     test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7004)))"]
+  #     interval: 15s
+  #     timeout: 5s
+  #     retries: 5
+  #     start_period: 20s
+  #   depends_on: [postgres, redis]
+
+  # ── New MCP servers: google / github / reddit / finnhub ──────────────────────
+  mcp-finnhub:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.calendar_server"]
-    ports: ["7001:7001"]
+    command: ["python", "-m", "app.mcp.servers.finnhub_server"]
+    ports: ["7005:7005"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-finnhub
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7001)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7005)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-gmail:
+  mcp-reddit:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.gmail_server"]
-    ports: ["7002:7002"]
+    command: ["python", "-m", "app.mcp.servers.reddit_server"]
+    ports: ["7006:7006"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-reddit
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7002)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7006)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-notion:
+  mcp-github:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.notion_server"]
-    ports: ["7003:7003"]
+    command: ["python", "-m", "app.mcp.servers.github_server"]
+    ports: ["7007:7007"]
     env_file: .env
     restart: on-failure
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7003)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7007)))"]
       interval: 15s
       timeout: 5s
       retries: 5
       start_period: 20s
     depends_on: [postgres, redis]
 
-  mcp-slack:
+  mcp-google:
     build: { context: ., dockerfile: infra/Dockerfile.mcp }
     init: true
-    command: ["python", "-m", "app.mcp.servers.slack_server"]
-    ports: ["7004:7004"]
+    command: ["python", "-m", "app.mcp.servers.google_server"]
+    ports: ["7008:7008"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-google
     healthcheck:
-      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7004)))"]
+      test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7008)))"]
       interval: 15s
       timeout: 5s
       retries: 5
@@ -148,11 +218,18 @@ services:
     env_file: .env
     environment:
       # Reach the MCP servers by their Docker service names, not localhost.
-      MCP_CALENDAR_URL: http://mcp-calendar:7001
-      MCP_GMAIL_URL: http://mcp-gmail:7002
-      MCP_NOTION_URL: http://mcp-notion:7003
-      MCP_SLACK_URL: http://mcp-slack:7004
+      # STALE (2026-06-22): old MCP URLs superseded by the google/github/reddit/finnhub set
+      # below; commented (not deleted) per CLAUDE.md R13.
+      # MCP_CALENDAR_URL: http://mcp-calendar:7001
+      # MCP_GMAIL_URL: http://mcp-gmail:7002
+      # MCP_NOTION_URL: http://mcp-notion:7003
+      # MCP_SLACK_URL: http://mcp-slack:7004
+      MCP_FINNHUB_URL: http://mcp-finnhub:7005
+      MCP_REDDIT_URL: http://mcp-reddit:7006
+      MCP_GITHUB_URL: http://mcp-github:7007
+      MCP_GOOGLE_URL: http://mcp-google:7008
       TZ: ${TZ:-UTC}
+      SERVICE_NAME: api
     depends_on:
       postgres:
         condition: service_healthy
@@ -174,10 +251,95 @@ services:
     ports: ["8501:8501"]
     env_file: .env
     environment:
+      # Reach the api by its Docker service name, not localhost (which inside
+      # this container is the streamlit process itself).
+      API_BASE_URL: http://api:8000
       TZ: ${TZ:-UTC}
+      SERVICE_NAME: streamlit
+    restart: on-failure
     depends_on: [api]
+
+  # React web UI (Vite build served by nginx, which also proxies /v1 → api).
+  # Runs alongside Streamlit during the migration; 3000 is Grafana, 8501 is
+  # Streamlit, so the SPA takes 8502.
+  web:
+    build: { context: ., dockerfile: infra/Dockerfile.web }
+    init: true
+    ports: ["8502:80"]
+    environment:
+      TZ: ${TZ:-UTC}
+    restart: on-failure
+    depends_on: [api]
+
+  # ── Observability: metrics time-series + dashboards ──────────────────────────
+  # Prometheus scrapes the app's /metrics (RED latency + guardrail counters) and the
+  # LiteLLM proxy's /metrics (spend/tokens). Grafana visualizes both. See infra/prometheus.yml
+  # and infra/grafana/ for scrape + provisioning config.
+  prometheus:
+    image: prom/prometheus:latest
+    ports: ["9090:9090"]
+    volumes:
+      - "./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
+      - "promdata:/prometheus"
+    restart: unless-stopped
+    depends_on: [api]
+
+  grafana:
+    image: grafana/grafana:latest
+    ports: ["3000:3000"]
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      # Anonymous read-only viewing so the dashboard opens without a login in local dev.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - "./infra/grafana/provisioning:/etc/grafana/provisioning:ro"
+      - "./infra/grafana/dashboards:/var/lib/grafana/dashboards:ro"
+      - "grafanadata:/var/lib/grafana"
+    restart: unless-stopped
+    depends_on: [prometheus]
+
+  # ── Logs: structlog JSON (stdout) → Alloy → Loki → Grafana ───────────────────
+  loki:
+    image: grafana/loki:latest
+    command: ["-config.file=/etc/loki/loki-config.yml"]
+    ports: ["3100:3100"]
+    volumes:
+      - "./infra/loki/loki-config.yml:/etc/loki/loki-config.yml:ro"
+      - "lokidata:/loki"
+    restart: unless-stopped
+
+  # Grafana Alloy is the supported successor to Promtail. It discovers the compose
+  # containers over the Docker socket, parses each structlog JSON line, and ships to
+  # Loki. The socket mount is what lets it see the other containers' logs.
+  alloy:
+    image: grafana/alloy:latest
+    # Run as root so the alloydata volume mounted at /var/lib/alloy/data is
+    # writable. The image's default `alloy` user (UID 473) cannot write to a fresh
+    # named-volume mount — that silently broke positions-file tracking and meant
+    # loki.source.docker shipped nothing reliably to Loki.
+    user: "0:0"
+    command:
+      - "run"
+      - "--server.http.listen-addr=0.0.0.0:12345"
+      - "--storage.path=/var/lib/alloy/data"
+      - "/etc/alloy/config.alloy"
+    ports: ["12345:12345"]
+    volumes:
+      - "./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro"
+      # Persist Alloy's positions cursor across restarts so tailing resumes where
+      # it left off instead of jumping to "now" and dropping anything older.
+      - "alloydata:/var/lib/alloy/data"
+      - "/var/lib/docker/containers:/var/lib/docker/containers:ro"
+      - "/var/run/docker.sock:/var/run/docker.sock:ro"
+    restart: unless-stopped
+    depends_on: [loki]
 
 volumes:
   pgdata:
   qdrantdata:
-  teidata:
+  promdata:
+  grafanadata:
+  lokidata:
+  alloydata:

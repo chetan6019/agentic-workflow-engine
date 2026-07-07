@@ -1,0 +1,12 @@
+# Grafana datasource provisioning: wire the Prometheus service as the default source.
+# The fixed uid ("prometheus") is referenced by the provisioned dashboard's panels.
+apiVersion: 1
+
+datasources:
+  - name: Prometheus
+    uid: prometheus
+    type: prometheus
+    access: proxy
+    url: http://prometheus:9090
+    isDefault: true
+    editable: true

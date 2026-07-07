@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 import time
 from json import JSONDecodeError
 from statistics import mean
@@ -12,71 +11,59 @@ from langchain_core.exceptions import OutputParserException
 from pydantic import ValidationError
 
 from app.agents.response_composer import compose
+from app.core.metrics import guard_outcome_total, node_latency_seconds
 from app.core.state import AgentState, DraftResponse, GuardVerdict
 from app.data.repositories import create_approval, get_token, save_plan
+from app.guardrails import evaluate_output
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_guard_judge_messages
+from app.security.redaction import contains_pii
 
 log = structlog.get_logger(__name__)
-# Guardrails confidence thresholds (also imported by the graph router). Kept here,
-# with the guardrails node, so the scoring and routing bands share one definition.
-_HIGH_CONFIDENCE = 0.85
-_LOW_CONFIDENCE = 0.55
-# Max planner re-plans before a low-confidence run is blocked. Lives here, with the
-# bands, because guardrails_node now owns the verdict decision (the graph router only
-# reads state.verdict). Imported by the graph for the routing map.
-_MAX_RETRIES = 2
-# When True, the medium-confidence band (0.55–0.85) pauses for HITL approval instead
-# of auto-finalizing. Disabled: confidence is computed AFTER the tools run, so a medium
-# score on a successful write would ask the user to approve an action that already
-# happened (rejecting can't undo it). Approval is reserved for deliberate PRE-action
-# gates instead — calendar clashes and destructive deletes, both handled in the
-# orchestrator. Low confidence (<0.55) still re-plans/blocks via the graph router.
-_HITL_ENABLED = False
-# Above this judge-reported risk the draft is treated as possibly unsupported by
-# the tool evidence and gets one corrective re-composition (see _mitigate_*).
-_HALLUCINATION_RISK_LIMIT = 0.7
-# Only fall back to a neutral verdict when the LLM responded with malformed
-# output — transport errors (rate limit, timeout, API error) propagate so the
-# run fails honestly instead of finalizing with a 0.5-judge confidence.
-_SCHEMA_ERRORS = (ValidationError, JSONDecodeError, OutputParserException)
 
-# Email addresses are intentionally NOT treated as blocking PII: this is an email
-# assistant, so sender/recipient addresses are inherent to legitimate output.
-# Only genuinely sensitive, low-false-positive patterns block the draft.
-_PII_PATTERNS = [
-    re.compile(r"\b\d{3}-\d{2}-\d{4}\b"),  # US SSN
-    re.compile(r"\b(?:\d{4}[ -]?){3}\d{4}\b"),  # 16-digit credit-card number
-]
+# ============================================================
+# CONFIGURATION (tweak these to change behavior)
+# ============================================================
+HIGH_CONFIDENCE = 0.85      # Auto-finalize above this
+LOW_CONFIDENCE = 0.55       # Re-plan below this, block if retries exhausted
+MAX_RETRIES = 2             # Max re-plans before blocking
+HALLUCINATION_RISK_LIMIT = 0.85  # Trigger re-compose if judge risk exceeds this
+HITL_ENABLED = False        # Medium-confidence pause for human approval (disabled)
 
+# Exceptions that mean "judge gave bad JSON" — not "LLM is down"
+SCHEMA_ERRORS = (ValidationError, JSONDecodeError, OutputParserException)
 
-def _contains_pii(text: str) -> bool:
-    """Return True if any PII regex matches the given text."""
-    return any(p.search(text) for p in _PII_PATTERNS)
+# ============================================================
+# HELPER: PII check across all draft text fields
+# ============================================================
+def draft_has_pii(draft: DraftResponse) -> bool:
+    """True if any user-facing field contains sensitive PII (SSN, credit card)."""
+    # Email addresses are OK — this is an email assistant
+    fields = [
+        draft.summary,
+        draft.detail_markdown,
+        *draft.actions_taken,
+        *draft.actions_pending,
+    ]
+    return any(contains_pii(text) for text in fields)
 
-
-def _draft_has_pii(draft: DraftResponse) -> bool:
-    """Scan every user-facing draft field for PII, not just the markdown body.
-
-    A leaked SSN/card number in the summary or an action line is just as exposed as
-    one in the detail body, so all text fields are checked (REVIEW.md R34).
+# ============================================================
+# STAGE 1: Fast deterministic checks (no LLM calls)
+# ============================================================
+async def run_deterministic_checks(state: AgentState) -> bool:
     """
-    fields = [draft.summary, draft.detail_markdown, *draft.actions_taken, *draft.actions_pending]
-    return any(_contains_pii(t) for t in fields)
-
-
-async def _stage_one(state: AgentState) -> bool:
-    """Run deterministic checks. Returns True if the LLM judge should run next."""
-    if state.draft and _draft_has_pii(state.draft):
+    Run quick checks. Return True if we should continue to LLM judge.
+    Sets state.error / state.confidence / state.requires_approval on failure.
+    """
+    # 1. PII in draft?
+    if state.draft and draft_has_pii(state.draft):
         log.warning("guard_blocked_pii", trace_id=state.trace_id)
         state.error = "pii_detected"
         state.confidence = 0.0
         state.requires_approval = True
         return False
 
-    # Destructive actions are gated pre-execution in the orchestrator, not here — by the
-    # time the guard runs the tools have already executed. This loop only verifies the
-    # user still has a valid integration token for every tool the plan touches.
+    # 2. Missing integration tokens for any planned tool?
     if state.plan:
         for step in state.plan.steps:
             token = await get_token(state.user_id, step.tool)
@@ -85,83 +72,92 @@ async def _stage_one(state: AgentState) -> bool:
                 state.error = f"missing_integration:{step.tool}"
                 state.confidence = 0.0
                 return False
+
     log.debug("guard_stage_one_passed")
     return True
 
-
-def _compute_confidence(state: AgentState, verdict: GuardVerdict) -> float:
-    """Blend execution success, LLM-judge quality, and schema validity into a 0–1 score.
-
-    Calibrated so a normal task NEVER needs human approval: when every tool call
-    succeeded and the draft is schema-valid, the score is >= 0.9 — comfortably above
-    the 0.85 finalize line — regardless of the judge. Execution success dominates
-    (0.8); the judge and schema are minor adjusters (0.1 each). Retrieval similarity
-    is deliberately excluded: a perfectly executed but novel request (no similar past
-    plan) is still high-confidence — the old 0.3 similarity weight wrongly capped such
-    runs at 0.7 and forced them into the medium band.
-
-    Approval is therefore reserved for the deterministic PRE-action gates in the
-    orchestrator — destructive deletes (always) and calendar clashes — not this score.
-    Tool failures pull the score below 0.55 so the graph re-plans, then blocks.
+# ============================================================
+# CONFIDENCE SCORING
+# ============================================================
+def compute_confidence(state: AgentState, verdict: GuardVerdict) -> float:
     """
+    Blend three signals into 0–1 confidence:
+      - 80% tool success rate
+      - 10% LLM judge average (tone, factuality, adherence)
+      - 10% schema validity
+    """
+    # Tool success rate (1.0 if no tools ran)
     if state.tool_results:
-        tool_success_rate = sum(1 for r in state.tool_results if r.ok) / len(state.tool_results)
+        tool_success = sum(1 for r in state.tool_results if r.ok) / len(state.tool_results)
     else:
-        tool_success_rate = 1.0
+        tool_success = 1.0
 
-    llm_judge_avg = mean(
-        [verdict.tone_fit, 1.0 - verdict.hallucination_risk, verdict.instruction_adherence]
-    )
+    # Judge average: tone_fit + (1 - hallucination_risk) + instruction_adherence
+    judge_avg = mean([
+        verdict.tone_fit,
+        1.0 - verdict.hallucination_risk,
+        verdict.instruction_adherence,
+    ])
 
+    # Schema validity
     schema_ok = 1.0 if isinstance(state.draft, DraftResponse) else 0.0
 
-    return 0.8 * tool_success_rate + 0.1 * llm_judge_avg + 0.1 * schema_ok
+    return 0.8 * tool_success + 0.1 * judge_avg + 0.1 * schema_ok
 
-
-async def _judge(state: AgentState) -> GuardVerdict:
+# ============================================================
+# LLM JUDGE: evaluates draft quality against evidence
+# ============================================================
+async def run_judge(state: AgentState) -> GuardVerdict:
     """Run the guard-judge LLM over the draft + tool-result evidence.
-
-    Malformed judge JSON falls back to a neutral verdict so scoring proceeds from
-    the deterministic signals; transport errors are NOT caught here and propagate.
+       Fallback to neutral verdict on malformed JSON only.
     """
     messages = build_guard_judge_messages(
-        draft=state.draft, user_request=state.user_request, tool_results=state.tool_results)
+        draft=state.draft, 
+        user_request=state.user_request, 
+        tool_results=state.tool_results
+    )
     llm = get_structured_llm("guard-judge", GuardVerdict, run_metadata(state))
+
     try:
         return await llm.ainvoke(messages)
-    except _SCHEMA_ERRORS as exc:
+    except SCHEMA_ERRORS as exc:
         log.warning("guard_judge_fallback_neutral", error=str(exc))
         if "guard_judge_neutral_fallback" not in state.degraded:
             state.degraded.append("guard_judge_neutral_fallback")
+        # Neutral middle-ground verdict
         return GuardVerdict(tone_fit=0.5, hallucination_risk=0.5, instruction_adherence=0.5)
 
-
-async def _mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> GuardVerdict:
-    """Re-compose once against the evidence, then re-judge; warn if still risky.
-
-    The tools have already executed, so re-planning would re-fire side effects.
-    Instead the composer gets a single corrective pass constrained to the tool
-    results, and the draft is re-judged. If it still reads as unsupported it
-    ships with a visible warning and a ``degraded`` flag rather than silently.
-    Returns the verdict that should drive the final confidence score.
+# ============================================================
+# HALLUCINATION MITIGATION: one corrective re-compose
+# ============================================================
+async def mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> GuardVerdict:
     """
-    log.warning("guard_hallucination_flagged", trace_id=state.trace_id,
-                hallucination_risk=round(verdict.hallucination_risk, 3))
+    If judge flags high hallucination risk, re-compose once with strict
+    "stick to evidence" instructions, then re-judge.
+    """
+    log.warning(
+        "guard_hallucination_flagged",
+        trace_id=state.trace_id,
+        hallucination_risk=round(verdict.hallucination_risk, 3),
+    )
     feedback = (
-        f"A previous draft was flagged for possible unsupported claims "
-        f"(hallucination_risk={verdict.hallucination_risk:.2f}). Rewrite the response "
-        f"using ONLY facts present in the tool results; remove or qualify any "
-        f"statement not directly supported by them."
+        f"Previous draft flagged for unsupported claims "
+        f"(hallucination_risk={verdict.hallucination_risk:.2f}). "
+        f"Rewrite using ONLY facts from tool results. "
+        f"Remove or qualify anything not directly supported."
     )
     try:
         state.draft = await compose(state, judge_feedback=feedback)
     except Exception as exc:  # transport/compose failure — keep the original draft
         log.warning("guard_recompose_failed", trace_id=state.trace_id, error=str(exc))
         state.degraded.append("hallucination_recompose_failed")
-        return verdict
+        return verdict  # keep the original verdict
 
-    new_verdict = await _judge(state)
-    if new_verdict.hallucination_risk > _HALLUCINATION_RISK_LIMIT and state.draft is not None:
+    # Re-judge the corrected draft
+    new_verdict = await run_judge(state)
+
+    if new_verdict.hallucination_risk > HALLUCINATION_RISK_LIMIT and state.draft is not None:
+        # Still risky — add visible warning to response
         state.draft.detail_markdown = (
             "> ⚠️ **Heads-up:** parts of this response may not be fully supported by "
             "the data retrieved. Please verify before acting.\n\n"
@@ -174,66 +170,145 @@ async def _mitigate_hallucination(state: AgentState, verdict: GuardVerdict) -> G
                  hallucination_risk=round(new_verdict.hallucination_risk, 3))
     return new_verdict
 
-
-def _decide_verdict(state: AgentState) -> None:
-    """Translate the computed confidence into an explicit verdict + its state changes.
-
-    Pure (no I/O): this is the ONE place the guardrails routing bands live, so the
-    graph router can stay a pure reader of ``state.verdict`` (REVIEW.md R6). The bands
-    match CLAUDE.md: >=0.85 finalize; 0.55-0.85 finalize (or HITL when enabled);
-    <0.55 re-plan until retries exhausted, then block. ``verdict`` is left None on the
-    error short-circuit so the router falls straight through to END.
+# ============================================================
+# VERDICT DECISION: map confidence → action
+# ============================================================
+def decide_verdict(state: AgentState) -> None:
+    """
+    Set state.verdict based on confidence bands.
+    Pure logic — no I/O. Graph router reads state.verdict only.
     """
     if state.error:
-        return
+        return  # Short-circuit: router will go to END
     conf = state.confidence
-    if conf >= _LOW_CONFIDENCE:
-        if _HITL_ENABLED and conf < _HIGH_CONFIDENCE:
+
+    if conf >= LOW_CONFIDENCE:
+        if HITL_ENABLED and conf < HIGH_CONFIDENCE:
             state.verdict = "hitl"
             state.requires_approval = True
         else:
             state.verdict = "finalize"
             state.phase = "finalize"
-    elif state.retry_count < _MAX_RETRIES:
-        # Reset for a fresh plan. verdict stays "replan" so the router goes to the
-        # planner, which clears it again before the next execute → guard pass.
+
+    elif state.retry_count < MAX_RETRIES:
+        # Re-plan: clear plan/results/draft for fresh attempt
         state.verdict = "replan"
         state.retry_count += 1
         state.plan = None
         state.tool_results = []
         state.draft = None
         state.confidence = 0.0
+
     else:
         state.verdict = "block"
         state.error = "low_confidence_blocked"
 
-
-async def guardrails_node(state: AgentState) -> AgentState:
-    """Score the draft, set confidence + verdict, and return updated state."""
-    t0 = time.monotonic()
-    log.info("guardrails_node_start", trace_id=state.trace_id)
-    should_continue = await _stage_one(state)
-    if not should_continue or state.draft is None:
-        log.info("guardrails_node_short_circuit", error=state.error)
-        return state
-
-    verdict = await _judge(state)
-    # Teeth: a high hallucination_risk triggers one corrective re-composition
-    # against the evidence (never a re-plan — tools already ran). The final
-    # verdict (re-judged when mitigated) is what feeds the confidence score.
-    if verdict.hallucination_risk > _HALLUCINATION_RISK_LIMIT:
-        verdict = await _mitigate_hallucination(state, verdict)
-
-    state.confidence = _compute_confidence(state, verdict)
-    _decide_verdict(state)
-    # HITL band: mint the approval token now so the router can simply route to END and
-    # the UI has a valid token to act on. (Inert while _HITL_ENABLED is False.)
-    if state.verdict == "hitl" and not state.approval_token:
+# ============================================================
+# OUTPUT GUARDRAILS: final safety gate before streaming
+# ============================================================
+async def run_output_guardrails(state: AgentState) -> bool:
+    """
+    Apply output guardrails (PII redaction, toxicity, etc.).
+    Returns True to continue; False to short-circuit (blocked or needs approval).
+    """
+    if state.draft is None:
+        return True
+    
+    decision = await evaluate_output(
+        state.draft.detail_markdown,
+        draft=state.draft, plan=state.plan, retrieved_plans=state.retrieved_plans,
+        user_id=state.user_id, trace_id=state.trace_id, source_was_user=False,
+    )
+    # Apply any redactions/truncations
+    if decision.text != state.draft.detail_markdown:
+        state.draft.detail_markdown = decision.text
+    # Hard block
+    if not decision.allowed:
+        state.error = f"guardrail_output:{','.join(decision.blocked_rules)}"
+        log.warning("output_guardrail_blocked", rules=decision.blocked_rules)
+        return False
+    # Needs human approval
+    if decision.requires_approval and not state.approval_token:
+        state.requires_approval = True
         state.approval_token = await create_approval(state.trace_id)
-        await save_plan(state)
-        log.info("guard_awaiting_approval", trace_id=state.trace_id,
-                 confidence=round(state.confidence, 3))
-    log.info("guardrails_node_done", confidence=round(state.confidence, 3),
-             verdict=state.verdict, requires_approval=state.requires_approval,
-             duration_ms=int((time.monotonic() - t0) * 1000))
-    return state
+        await save_plan(state)  # persist token + redacted draft so resume finds them
+        log.info("output_guardrail_awaiting_approval", trace_id=state.trace_id,
+                 rules=[h.rule for h in decision.hits if h.action == "flag_for_approval"])
+        return False
+    return True
+
+# ============================================================
+# MAIN NODE: orchestrates the guardrails pipeline
+# ============================================================
+async def guardrails_node(state: AgentState) -> AgentState:
+    """Main entry point — runs full guardrails pipeline.
+       - Score the draft
+       - set confidence + verdict
+       - return updated state.
+    """
+    with structlog.contextvars.bound_contextvars(
+        trace_id=state.trace_id,
+        user_id=state.user_id,
+        session_id=state.session_id,
+        node="guardrails",
+        
+    ):
+        start = time.monotonic()
+        log.info("guardrails_node_start", trace_id=state.trace_id)
+
+        # Stage 1: Fast deterministic checks
+        should_continue = await run_deterministic_checks(state)
+        if not should_continue or state.draft is None:
+            # Short-circuit before judge ever ran. Bucket as "block" because the
+            # deterministic check set state.error and won't proceed — same effect
+            # as a low-confidence block from the policy point of view.
+            guard_outcome_total.labels(outcome="block").inc()
+            log.info("guardrails_node_short_circuit", error=state.error)
+            return state
+        
+        # Stage 2: LLM judge evaluates draft quality
+        verdict = await run_judge(state)
+
+        # Stage 3: Hallucination mitigation (re-compose once if needed)
+        if verdict.hallucination_risk > HALLUCINATION_RISK_LIMIT:
+            verdict = await mitigate_hallucination(state, verdict)
+
+        # Stage 4: Output guardrails(final safety gate)(redact/flag/block) before it can finalize.
+        if not await run_output_guardrails(state):
+            # Output gate failed — either hard block or "requires approval".
+            # `state.requires_approval` distinguishes the two; map to existing
+            # verdict vocabulary so the metric uses one consistent dialect.
+            guard_outcome_total.labels(
+                outcome="hitl" if state.requires_approval else "block"
+            ).inc()
+            log.info("guardrails_node_output_gate", error=state.error,
+                    requires_approval=state.requires_approval)
+            return state
+
+        # Stage 5: Compute confidence & decide verdict
+        state.confidence = compute_confidence(state, verdict)
+        decide_verdict(state)
+
+        # Record the verdict outcome for the "auto-approval rate" metric.
+        # decide_verdict can leave state.verdict as None if state.error short-
+        # circuits — use "block" as the fallback so every guard call contributes
+        # exactly one observation (counters with missing samples skew rates).
+        guard_outcome_total.labels(outcome=state.verdict or "block").inc()
+
+        # Mint approval token if HITL (inert while HITL_ENABLED=False)
+        if state.verdict == "hitl" and not state.approval_token:
+            state.approval_token = await create_approval(state.trace_id)
+            await save_plan(state)
+            log.info("guard_awaiting_approval", trace_id=state.trace_id,
+                    confidence=round(state.confidence, 3))
+        
+        # Metrics
+        duration_ms = int((time.monotonic() - start) * 1000)
+        node_latency_seconds.labels(node="guardrails").observe(time.monotonic() - start)
+        log.info("guardrails_node_done", 
+                confidence=round(state.confidence, 3),
+                verdict=state.verdict, 
+                requires_approval=state.requires_approval,
+                duration_ms=duration_ms)
+        
+        return state

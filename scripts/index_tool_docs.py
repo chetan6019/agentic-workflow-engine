@@ -21,7 +21,11 @@ from app.rag.embedder import embed_named
 from app.rag.qdrant_client import ensure_collections, get_qdrant
 
 log = structlog.get_logger(__name__)
-_SERVERS = ["calendar", "gmail", "notion", "slack"]
+# STALE (2026-06-23): old MCP servers superseded by google/github/reddit/finnhub. This seeder
+# populates the tool_capability_docs collection the planner reads, so it MUST list the live
+# servers — otherwise the planner keeps emitting retired tool names. Old list kept per R13.
+# _SERVERS = ["calendar", "gmail", "notion", "slack"]
+_SERVERS = ["finnhub", "reddit", "github", "google"]
 
 
 def _strip_user_id(schema: dict) -> dict:

@@ -1,3 +1,5 @@
+# STALE (2026-06-22): superseded by google_server.py (Gmail + Calendar on one token, port 7008);
+# excluded from docker-compose and the MCP client registry. Kept in place per CLAUDE.md R13.
 """MCP Gmail server — deterministic Gmail adapter on port 7002."""
 
 from __future__ import annotations

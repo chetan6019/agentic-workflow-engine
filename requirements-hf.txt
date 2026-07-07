@@ -1,0 +1,12 @@
+# Optional local-embeddings extras — install only when running with
+# EMBEDDING_PROVIDER=hf (default is "openai" via the LiteLLM proxy, see
+# app/config.py). Pulls in torch (~2-3GB CPU wheel from PyTorch's own index),
+# so it's kept out of requirements.txt / CI / Docker builds by default.
+#
+#   pip install -r requirements.txt -r requirements-hf.txt
+
+langchain-huggingface
+sentence-transformers
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.1+cpu

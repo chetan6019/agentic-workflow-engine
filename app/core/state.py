@@ -25,7 +25,7 @@ class ToolSpec(BaseModel):
 
     name: str = Field(description="Tool name as exposed by the MCP server.")
     description: str = Field(description="Human-readable summary of what the tool does.")
-    server: str = Field(description="MCP server key (calendar | gmail | notion | slack).")
+    server: str = Field(description="MCP server key (google | github | reddit | finnhub).")
     input_schema: dict[str, Any] = Field(
         default_factory=dict, description="JSON schema for the tool's input arguments."
     )
@@ -57,7 +57,11 @@ class ExecutionPlan(BaseModel):
     strategy: Literal["sequential", "parallel", "mixed"] = Field(
         description="Execution strategy for the orchestrator."
     )
-    complexity_score: int = Field(ge=1, le=10, description="Planner self-rated complexity 1-10.")
+    complexity_score: int = Field(
+        ge=0, le=10,
+        description="Planner self-rated complexity. 0 = no tools needed (greeting / standalone "
+        "question answered directly); 1-10 for plans that invoke tools.",
+    )
     estimated_cost_usd: float = Field(ge=0.0, description="Rough estimated total cost in USD.")
     requires_approval: bool = Field(description="True if planner thinks HITL approval is needed.")
 
@@ -135,7 +139,7 @@ class AgentState(BaseModel):
     approval_token: str | None = Field(default=None, description="Token issued for HITL resume.")
     retry_count: int = Field(default=0, ge=0, description="Number of planner retries used.")
     error: str | None = Field(default=None, description="Terminal error code if any.")
-    phase: Literal["entry", "execute", "finalize", "noop"] = Field(
+    phase: Literal["entry", "execute", "finalize", "noop", "error"] = Field(
         default="entry",
         description="Explicit orchestrator phase, advanced by the nodes. Replaces the old "
         "field-presence inference so dispatch never depends on sentinel values.",

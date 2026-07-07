@@ -127,7 +127,9 @@ async def test_retrieve_orders_by_fused_score(monkeypatch):
     out = await retriever.retrieve(state)
 
     assert len(out) == retriever._TOP_N
-    assert [p.plan_id for p in out] == ["6", "5", "4", "3", "2"]  # highest fused first
+    # Full fused-descending order is 6..0; retrieve() returns the first _TOP_N of it.
+    full_fused_order = ["6", "5", "4", "3", "2", "1", "0"]
+    assert [p.plan_id for p in out] == full_fused_order[: retriever._TOP_N]
 
 
 async def test_route_query_falls_back_to_raw_request_on_llm_failure(monkeypatch):
@@ -164,3 +166,97 @@ async def test_retrieve_skips_search_when_router_says_no(monkeypatch):
 
     assert await retriever.retrieve(state) == []
     assert searched == []
+
+
+def test_estimate_tokens_counts_payload_text():
+    plan = retriever.RetrievedPlan(
+        plan_id="p1", request_text="a" * 40, summary="b" * 40,
+        plan_json={}, similarity=0.9, fused_score=0.9)
+    # 40 + 40 chars of text + 2 chars of "{}" = 82 chars → 82 // 4 = 20 tokens.
+    assert retriever._estimate_tokens([plan]) == 20
+    assert retriever._estimate_tokens([]) == 0
+
+
+class _FakeRedis:
+    """Minimal async get/set stand-in for the router cache."""
+
+    def __init__(self):
+        self.store: dict[str, str] = {}
+
+    async def get(self, key):
+        return self.store.get(key)
+
+    async def set(self, key, value, ex=None):
+        self.store[key] = value
+
+
+def _patch_router_cache(monkeypatch, ttl: int = 3600) -> _FakeRedis:
+    fake = _FakeRedis()
+    monkeypatch.setattr(retriever, "get_redis", lambda: fake)
+    monkeypatch.setattr(retriever, "get_settings",
+                        lambda: SimpleNamespace(router_cache_ttl_sec=ttl))
+    return fake
+
+
+async def test_route_query_caches_decision_and_skips_llm_on_repeat(monkeypatch):
+    """Second call with the same (normalized) request must not touch the LLM."""
+    calls: list[int] = []
+
+    class _LLM:
+        async def ainvoke(self, _msgs):
+            calls.append(1)
+            return retriever._RouteDecision(should_retrieve=True, query="unread emails")
+
+    fake_redis = _patch_router_cache(monkeypatch)
+    monkeypatch.setattr(retriever, "get_structured_llm", lambda *a, **k: _LLM())
+
+    first = retriever.AgentState(trace_id="t1", user_id="u", session_id="s",
+                                 user_request="Show my unread emails")
+    # Different casing/whitespace — must normalize to the same cache key.
+    second = retriever.AgentState(trace_id="t2", user_id="u", session_id="s",
+                                  user_request="show  my UNREAD emails")
+
+    r1 = await retriever._route_query(first, {})
+    r2 = await retriever._route_query(second, {})
+
+    assert len(calls) == 1  # one LLM call total; second was a cache hit
+    assert r1.query == r2.query == "unread emails"
+    assert len(fake_redis.store) == 1
+
+
+async def test_route_query_fallback_is_never_cached(monkeypatch):
+    """An LLM failure must not poison the cache with the raw-request fallback."""
+    class _Boom:
+        async def ainvoke(self, _msgs):
+            raise RuntimeError("llm down")
+
+    fake_redis = _patch_router_cache(monkeypatch)
+    monkeypatch.setattr(retriever, "get_structured_llm", lambda *a, **k: _Boom())
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s",
+                                 user_request="find my unread emails")
+
+    route = await retriever._route_query(state, {})
+
+    assert route.should_retrieve is True
+    assert fake_redis.store == {}
+
+
+async def test_route_query_cache_disabled_by_zero_ttl(monkeypatch):
+    """router_cache_ttl_sec=0 must bypass Redis entirely."""
+    calls: list[int] = []
+
+    class _LLM:
+        async def ainvoke(self, _msgs):
+            calls.append(1)
+            return retriever._RouteDecision(should_retrieve=True, query="q")
+
+    fake_redis = _patch_router_cache(monkeypatch, ttl=0)
+    monkeypatch.setattr(retriever, "get_structured_llm", lambda *a, **k: _LLM())
+    state = retriever.AgentState(trace_id="t", user_id="u", session_id="s",
+                                 user_request="find my unread emails")
+
+    await retriever._route_query(state, {})
+    await retriever._route_query(state, {})
+
+    assert len(calls) == 2  # no caching
+    assert fake_redis.store == {}

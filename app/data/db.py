@@ -9,14 +9,19 @@ ready. Evolve the schema by adding Alembic revisions
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from functools import lru_cache
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import structlog
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import get_settings
+
+if TYPE_CHECKING:
+    from alembic.config import Config
 
 # Repo root holds alembic.ini and the alembic/ package; resolve absolutely so the
 # config works regardless of the process's current working directory.
@@ -38,7 +43,7 @@ def _session_factory() -> async_sessionmaker[AsyncSession]:
 
 
 @asynccontextmanager
-async def get_async_session():
+async def get_async_session() -> AsyncIterator[AsyncSession]:
     """Yield an AsyncSession; auto-commits on clean exit, rolls back on error."""
     factory = _session_factory()
     async with factory() as session:
@@ -50,7 +55,7 @@ async def get_async_session():
             raise
 
 
-def _alembic_config():
+def _alembic_config() -> Config:
     """Build an Alembic Config pointing at the repo's alembic.ini + alembic/ dir."""
     from alembic.config import Config
 
@@ -65,7 +70,7 @@ async def _is_pre_alembic_db() -> bool:
     Lets us adopt Alembic on a database first created by the old create_all path:
     stamp it to head instead of trying to re-create existing tables.
     """
-    import asyncpg
+    import asyncpg  # type: ignore[import-untyped]
 
     dsn = get_settings().database_url.replace("+asyncpg", "")
     conn = await asyncpg.connect(dsn)

@@ -1,15 +1,62 @@
-FROM python:3.13-slim
+# ============================================================================
+# Stage 1: builder — compile any native wheels, populate a venv
+# ============================================================================
+FROM python:3.13-slim-bookworm AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    PIP_NO_CACHE_DIR=1
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1
+
+# Build-time only: compilers + headers for native wheels (asyncpg, cryptography, ...)
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends \
+        build-essential \
+        gcc \
+        libpq-dev \
+ && rm -rf /var/lib/apt/lists/*
+
+# A venv is the unit we'll copy into the runtime stage — clean and portable.
+RUN python -m venv /opt/venv
+ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 
-# curl: api healthcheck. tzdata: named timezones (e.g. Asia/Kolkata via TZ env).
+# Copy ONLY requirements first so editing app code doesn't bust this layer.
+COPY requirements.txt ./
+RUN pip install --upgrade pip \
+ && pip install -r requirements.txt
+
+# ============================================================================
+# Stage 2: runtime — slim image, no compilers, just venv + app
+# ============================================================================
+FROM python:3.13-slim-bookworm AS runtime
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PATH="/opt/venv/bin:$PATH"
+
+# Runtime-only deps: curl for the healthcheck, tzdata for Asia/Kolkata-style TZ vars.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends curl tzdata \
  && rm -rf /var/lib/apt/lists/*
 
-COPY requirements.txt ./
-RUN pip install --upgrade pip && pip install -r requirements.txt
+# Non-root user so the container doesn't run as root in prod.
+RUN useradd --create-home --shell /bin/bash --uid 1000 app
+
+WORKDIR /app
+
+# Copy the prebuilt venv from the builder — no compilers, no pip cache, no source.
+COPY --from=builder /opt/venv /opt/venv
+
+# App code last so code edits invalidate only this layer, not deps.
+COPY --chown=app:app . .
+
+USER app
+
+EXPOSE 8000
+
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD curl -fsS http://localhost:8000/healthz || exit 1
+
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]

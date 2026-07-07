@@ -1,0 +1,84 @@
+# RAGAS evaluation gate for the RAG layer (see docs/adr/0008-ragas-gates.md).
+# Kept in its own workflow so it can path-filter on PRs without disturbing the
+# main CI workflow. ADVISORY (non-blocking) initially: the gated metric run needs
+# a live LiteLLM judge + seeded Qdrant, which CI does not yet provide. The dry-run
+# (dataset + wiring validation) always runs and is authoritative.
+name: eval-ragas
+
+on:
+  pull_request:
+    paths:
+      - "app/rag/**"
+      - "app/prompts.py"
+      - "tests/eval/**"
+      - "scripts/eval/**"
+  workflow_dispatch: {}
+
+# Least-privilege default; the job below widens only what the PR-comment step needs.
+permissions:
+  contents: read
+
+jobs:
+  eval-ragas:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    # "Comment score table on PR" uses github.rest.issues.createComment against a PR,
+    # which the REST API accepts under either issues:write or pull-requests:write — the
+    # repo's default GITHUB_TOKEN scope didn't include either, causing a 403 "Resource
+    # not accessible by integration". pull-requests:write is the precise scope for this.
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies (with eval extra)
+        run: uv sync --extra eval
+
+      - name: RAGAS dry-run (dataset + wiring validation — gating)
+        run: uv run python scripts/eval/run_ragas.py --dry-run
+
+      - name: RAGAS gated eval (advisory until judge + Qdrant wired in CI)
+        continue-on-error: true
+        env:
+          # Provided once a judge model + seeded Qdrant exist in CI; until then the
+          # step degrades to a clear failure and stays advisory.
+          EVAL_JUDGE_MODEL: ${{ vars.EVAL_JUDGE_MODEL || 'composer' }}
+        run: uv run python scripts/eval/run_ragas.py --subset 30
+
+      - name: Upload RAGAS report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ragas-report
+          path: artifacts/ragas/
+
+      - name: Comment score table on PR
+        if: always() && github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const dir = 'artifacts/ragas';
+            if (!fs.existsSync(dir)) return;
+            const file = fs.readdirSync(dir).find(f => f.endsWith('.json'));
+            if (!file) return;
+            const r = JSON.parse(fs.readFileSync(`${dir}/${file}`, 'utf8'));
+            const rows = Object.entries(r.scores || {})
+              .map(([m, v]) => `| ${m} | ${v} | ${r.thresholds[m] ?? '—'} |`).join('\n');
+            const body = `### RAGAS eval (${r.git_sha}, ${r.rows} rows)\n` +
+              (r.dry_run ? '_dry-run only (no live judge)_\n' : '') +
+              `\n| metric | score | threshold |\n|---|---|---|\n${rows || '| — | — | — |'}\n` +
+              `\n**Result:** ${r.passed ? 'PASS ✅' : 'advisory / not gated yet'}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number, body });

@@ -1,0 +1,38 @@
+# Loki single-binary config for local dev — filesystem storage, no auth.
+# Mounted read-only into the loki container (see docker-compose.yml).
+
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 0.0.0.0
+  path_prefix: /loki
+  storage:
+    filesystem:
+      chunks_directory: /loki/chunks
+      rules_directory: /loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Keep a generous-but-finite retention window for a dev box.
+  retention_period: 168h
+  # structlog binds trace_id/user_id as JSON fields (queried, not labelled), so the
+  # per-stream label set stays small; allow a few extra to be safe.
+  max_label_names_per_series: 15

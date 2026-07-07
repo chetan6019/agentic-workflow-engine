@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import time
+from functools import lru_cache
 from typing import Any
 
 import structlog
@@ -19,20 +22,24 @@ from qdrant_client.http.models import (
 
 from app.config import get_settings
 from app.core.state import AgentState, RetrievedPlan
+from app.data.redis_client import get_redis
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import (
     build_retriever_grader_messages,
     build_retriever_router_messages,
 )
-from app.rag.embedder import embed_sparse, embed_text
+from app.rag.embedder import embed_sparse, embed_text, rerank_scores
 from app.rag.qdrant_client import DENSE_VECTOR, SPARSE_VECTOR, get_qdrant
 
 log = structlog.get_logger(__name__)
 _PLANS_COLLECTION = "plans"
 _SEARCH_K = 10
-_TOP_N = 5
+_TOP_N = 3
 _MIN_AFTER_GRADE = 3
-_RELEVANCE_THRESHOLD = 0.7
+_RELEVANCE_THRESHOLD = 0.75
+# After a cross-encoder rerank, keep this many candidates for the (pricier) LLM grader.
+# Must stay >= _MIN_AFTER_GRADE so the grade step still has enough to clear the threshold.
+_RERANK_TOP_N = 5
 
 
 class _RouteDecision(BaseModel):
@@ -61,6 +68,104 @@ class _GraderOutput(BaseModel):
     hits: list[_GradedHit] = Field(description="Per-candidate grades.")
 
 
+@lru_cache(maxsize=1)
+def _langfuse_client() -> Any | None:
+    """Lazily build a Langfuse client; None if the SDK or config is unavailable."""
+    try:
+        from langfuse import Langfuse
+
+        return Langfuse()
+    except Exception:
+        return None
+
+
+def _emit_retrieval_event(state: AgentState, query: str, fetched: list[RetrievedPlan],
+                          kept: list[RetrievedPlan], elapsed_ms: int) -> None:
+    """Best-effort: attach a retrieval event to the run's Langfuse trace.
+
+    Without this, Langfuse traces show only the LLM generations — what Qdrant
+    actually returned is invisible, so "bad retrieval vs bad generation" can't be
+    debugged from a trace. Mirrors the guardrails engine's best-effort pattern:
+    skipped when keys aren't configured, never run-fatal.
+    """
+    # getattr: tests stub get_settings() with a minimal namespace lacking these keys.
+    settings = get_settings()
+    if not (getattr(settings, "langfuse_public_key", None)
+            and getattr(settings, "langfuse_secret_key", None)):
+        return
+    client = _langfuse_client()
+    if client is None:
+        return
+    try:
+        client.create_event(
+            trace_context={"trace_id": state.trace_id},
+            name="retrieval",
+            input={"query": query},
+            output=[{"plan_id": p.plan_id, "similarity": round(p.similarity, 3),
+                     "fused_score": round(p.fused_score, 3)} for p in kept],
+            metadata={"collection": _PLANS_COLLECTION, "fetched": len(fetched),
+                      "kept": len(kept), "latency_ms": elapsed_ms},
+        )
+    except Exception as exc:
+        log.debug("retrieve_langfuse_failed", error=str(exc))
+
+
+def _estimate_tokens(plans: list[RetrievedPlan]) -> int:
+    """Rough token estimate (chars // 4) of a candidate set's payload text.
+
+    Good enough for observability — this feeds a structlog counter comparing how
+    much text retrieval FETCHED vs what survived rerank+grade, not billing (exact
+    per-call tokens stay LiteLLM's job). chars/4 is the standard English-text
+    approximation and needs no tokenizer dependency.
+    """
+    chars = 0
+    for p in plans:
+        chars += len(p.request_text) + len(p.summary) + len(json.dumps(p.plan_json))
+    return chars // 4
+
+
+def _router_cache_key(user_request: str) -> str:
+    """Redis key for a router decision, from the normalized request text.
+
+    Normalizing (lowercase + collapsed whitespace) makes "Show my unread emails"
+    and "show  my unread EMAILS" share one entry — a cheap step toward semantic
+    caching without an embedding lookup. The decision is user-independent (it
+    only classifies the request text), so the key carries no user_id.
+    """
+    normalized = " ".join(user_request.lower().split())
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+    return f"routercache:{digest}"
+
+
+async def _cached_route(user_request: str) -> _RouteDecision | None:
+    """Return a previously cached router decision, or None. Fails open on Redis errors."""
+    if get_settings().router_cache_ttl_sec <= 0:
+        return None
+    try:
+        raw = await get_redis().get(_router_cache_key(user_request))
+    except Exception as exc:
+        log.warning("router_cache_read_failed", error=str(exc))
+        return None
+    if not raw:
+        return None
+    try:
+        return _RouteDecision.model_validate_json(raw)
+    except Exception:
+        return None  # corrupt entry — treat as a miss, the LLM call overwrites it
+
+
+async def _store_route(user_request: str, decision: _RouteDecision) -> None:
+    """Best-effort write of a router decision to Redis; errors only logged."""
+    ttl = get_settings().router_cache_ttl_sec
+    if ttl <= 0:
+        return
+    try:
+        await get_redis().set(_router_cache_key(user_request),
+                              decision.model_dump_json(), ex=ttl)
+    except Exception as exc:
+        log.warning("router_cache_write_failed", error=str(exc))
+
+
 async def _route_query(state: AgentState, metadata: dict[str, str]) -> _RouteDecision:
     """One structured call: decide IF retrieval helps AND rewrite the search query.
 
@@ -68,7 +173,15 @@ async def _route_query(state: AgentState, metadata: dict[str, str]) -> _RouteDec
     round-trip from every request's critical path. On any LLM failure, fall
     back to retrieving with the raw request — retrieval is best-effort and
     must never be run-fatal.
+
+    Decisions are cached in Redis keyed by the normalized request text (see
+    _router_cache_key), so a repeated request skips this LLM call entirely.
+    Only successful LLM decisions are cached — never the fallback.
     """
+    cached = await _cached_route(state.user_request)
+    if cached is not None:
+        log.info("retrieve_route_cache_hit", should_retrieve=cached.should_retrieve)
+        return cached
     msgs = build_retriever_router_messages(user_request=state.user_request)
     llm = get_structured_llm("retriever-grader", _RouteDecision, metadata)
     try:
@@ -78,6 +191,7 @@ async def _route_query(state: AgentState, metadata: dict[str, str]) -> _RouteDec
         return _RouteDecision(should_retrieve=True, query=state.user_request)
     if not decision.query.strip():
         decision.query = state.user_request
+    await _store_route(state.user_request, decision)
     return decision
 
 
@@ -121,9 +235,9 @@ async def _dense_only_search(
         query_filter=qfilter,
         limit=k,
     )).points
-    plans = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
-             for h in hits]
-    plans = [p for p in plans if p is not None]
+    raw = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
+           for h in hits]
+    plans = [p for p in raw if p is not None]
     log.info("search_timing", mode="dense", total_ms=int((time.monotonic() - t0) * 1000),
              hits=len(plans))
     return plans
@@ -181,6 +295,26 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     return plans
 
 
+async def _rerank(query: str, candidates: list[RetrievedPlan]) -> list[RetrievedPlan]:
+    """Cross-encoder rerank: re-score candidates by joint (query, summary) relevance.
+
+    A no-op (returns the input order unchanged) unless RERANK_ENABLED is set. When on,
+    the cross-encoder jointly encodes the query with each candidate's summary — far more
+    accurate than the bi-encoder/RRF first-stage order — and we keep the top
+    ``_RERANK_TOP_N``. This is a cheap pre-filter that narrows what the LLM grader sees.
+    """
+    if not get_settings().rerank_enabled or not candidates:
+        return candidates
+    # Score against the human-readable summary, falling back to the raw request text.
+    docs = [c.summary or c.request_text for c in candidates]
+    scores = await rerank_scores(query, docs)
+    paired = list(zip(scores, candidates))
+    paired.sort(key=lambda sc: sc[0], reverse=True)
+    log.info("retrieve_reranked",
+             scores=[{"plan_id": c.plan_id, "score": round(s, 3)} for s, c in paired])
+    return [c for _, c in paired[:_RERANK_TOP_N]]
+
+
 async def _grade(candidates: list[RetrievedPlan], user_request: str,
                  metadata: dict[str, str]) -> list[RetrievedPlan]:
     """Ask the grader LLM to score candidates, drop ones below the threshold."""
@@ -206,19 +340,38 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str,
 
 async def retrieve(state: AgentState) -> list[RetrievedPlan]:
     """Run the agentic retrieval loop and return up to 5 graded RetrievedPlans."""
+    t0 = time.monotonic()
     meta = run_metadata(state)
     route = await _route_query(state, meta)
     if not route.should_retrieve:
         log.info("retrieve_skipped", trace_id=state.trace_id)
         return []
-    candidates = await _search(route.query, {"user_id": state.user_id, "success": True})
+    hits = await _search(route.query, {"user_id": state.user_id, "success": True})
+    fetched = list(hits)  # everything retrieval pulled in, for the token log below
+    candidates = await _rerank(route.query, hits)
     graded = await _grade(candidates, state.user_request, meta)
     log.info("retrieve_user_scoped", candidates=len(candidates), graded=len(graded))
     if len(graded) < _MIN_AFTER_GRADE:
-        broad = await _search(route.query, {"success": True})
+        broad_hits = await _search(route.query, {"success": True})
+        fetched.extend(broad_hits)
+        broad = await _rerank(route.query, broad_hits)
         graded = await _grade(broad, state.user_request, meta)
         log.info("retrieve_broadened", candidates=len(broad), graded=len(graded))
-    # Order by the fused score so RRF's blend wins; in dense-only mode fused_score
-    # equals the cosine, so this stays correct either way.
-    graded.sort(key=lambda p: p.fused_score, reverse=True)
-    return graded[:_TOP_N]
+    # When the cross-encoder reranker is on, its ordering is the best signal we have, so
+    # keep it. Otherwise order by the RRF fused score (== cosine in dense-only mode).
+    if not get_settings().rerank_enabled:
+        graded.sort(key=lambda p: p.fused_score, reverse=True)
+    kept = graded[:_TOP_N]
+    # Pre vs post token accounting: how much text search fetched vs what the
+    # rerank+grade funnel let through toward the planner. Estimates (chars/4),
+    # emitted per run so the reduction is visible in app logs and dashboards.
+    pre_tokens = _estimate_tokens(fetched)
+    post_tokens = _estimate_tokens(kept)
+    log.info("retrieve_token_counts",
+             pre_retrieval_tokens=pre_tokens,
+             post_retrieval_tokens=post_tokens,
+             tokens_dropped=pre_tokens - post_tokens,
+             fetched=len(fetched), kept=len(kept))
+    _emit_retrieval_event(state, route.query, fetched, kept,
+                          int((time.monotonic() - t0) * 1000))
+    return kept
