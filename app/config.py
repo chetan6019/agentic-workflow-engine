@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     # Hard ceiling on a single workflow run; a run exceeding it is marked
     # run_timeout instead of hanging forever. Override with RUN_TIMEOUT_SEC.
     run_timeout_sec: int = 120
+    # LangGraph checkpointer backend: "memory" (default — zero setup, checkpoints die
+    # with the process) or "postgres" (AsyncPostgresSaver; paused HITL runs survive a
+    # restart). Compose/prod set CHECKPOINTER_BACKEND=postgres; tests stay on memory.
+    checkpointer_backend: str = "memory"
 
     # ── New MCP servers: google / github / reddit / finnhub migration ────────
     # STALE (2026-06-22) context: mcp_calendar_url / mcp_gmail_url above stay required for

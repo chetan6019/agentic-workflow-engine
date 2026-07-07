@@ -234,17 +234,30 @@ NO-TOOL REQUESTS:
 - If the request needs NO tools — a greeting, small talk, a thank-you, or a question you can
   answer directly from your own knowledge or <history> — return an EMPTY `steps` list with
   `complexity_score` 0 and `strategy` "sequential". A later step composes the direct reply.
+
+CONFIDENCE:
+- Rate EVERY step with "confidence": "high" | "medium" | "low".
+  high = a routine read, or a write whose arguments the user stated explicitly;
+  medium = arguments are ambiguous or partly inferred from context/history;
+  low = you are guessing at what the user wants.
+  Medium/low-confidence writes PAUSE for human approval before running, so rate
+  honestly — never inflate to high to skip the pause.
 </instructions>
 <output_format>
 Output ONLY valid json, no prose, matching exactly:
 {"reasoning": "string",
  "steps": [{"id": "string", "tool": "google", "action": "send_email",
-            "arguments": {}, "depends_on": ["string"]}],
+            "arguments": {}, "depends_on": ["string"], "confidence": "high|medium|low"}],
  "strategy": "sequential|parallel|mixed",
  "complexity_score": 5, "estimated_cost_usd": 0.0, "requires_approval": false}
-Example — send an email:
+Example — send an email (recipient and text given explicitly):
 {"id":"s1","tool":"google","action":"send_email",
- "arguments":{"to":"a@b.com","subject":"Hi","body":"Hello"},"depends_on":[]}
+ "arguments":{"to":"a@b.com","subject":"Hi","body":"Hello"},"depends_on":[],
+ "confidence":"high"}
+Example — "reply to that thread" (recipient inferred from history):
+{"id":"s1","tool":"google","action":"reply_thread",
+ "arguments":{"thread_id":"t123","body":"Sounds good."},"depends_on":[],
+ "confidence":"medium"}
 Example — greeting / no tools needed:
 {"reasoning":"User only greeted; no tools needed.","steps":[],
  "strategy":"sequential","complexity_score":0,"estimated_cost_usd":0.0,"requires_approval":false}

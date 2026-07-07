@@ -8,12 +8,13 @@ from statistics import mean
 
 import structlog
 from langchain_core.exceptions import OutputParserException
+from langgraph.types import interrupt
 from pydantic import ValidationError
 
 from app.agents.response_composer import compose
 from app.core.metrics import guard_outcome_total, node_latency_seconds
 from app.core.state import AgentState, DraftResponse, GuardVerdict
-from app.data.repositories import create_approval, get_token, save_plan
+from app.data.repositories import create_approval, get_or_create_approval, get_token, save_plan
 from app.guardrails import evaluate_output
 from app.llm.client import get_structured_llm, run_metadata
 from app.prompts import build_guard_judge_messages
@@ -191,10 +192,12 @@ def decide_verdict(state: AgentState) -> None:
             state.phase = "finalize"
 
     elif state.retry_count < MAX_RETRIES:
-        # Re-plan: clear plan/results/draft for fresh attempt
+        # Re-plan: clear plan/results/draft for fresh attempt. A replanned plan is a
+        # NEW set of steps, so it must pass the pre-execution gate again.
         state.verdict = "replan"
         state.retry_count += 1
         state.plan = None
+        state.plan_approved = False
         state.tool_results = []
         state.draft = None
         state.confidence = 0.0
@@ -227,14 +230,28 @@ async def run_output_guardrails(state: AgentState) -> bool:
         state.error = f"guardrail_output:{','.join(decision.blocked_rules)}"
         log.warning("output_guardrail_blocked", rules=decision.blocked_rules)
         return False
-    # Needs human approval
+    # Needs human approval: pause via native interrupt(). On resume this node
+    # REPLAYS from the top (an extra judge call — acceptable); side effects here
+    # are idempotent (save_plan upserts, get_or_create_approval never mints twice).
     if decision.requires_approval and not state.approval_token:
         state.requires_approval = True
-        state.approval_token = await create_approval(state.trace_id)
-        await save_plan(state)  # persist token + redacted draft so resume finds them
+        await save_plan(state)  # plans row must exist before the approvals FK insert
+        state.approval_token = await get_or_create_approval(state.trace_id)
+        await save_plan(state)  # persist token + redacted draft for the approval card
         log.info("output_guardrail_awaiting_approval", trace_id=state.trace_id,
                  rules=[h.rule for h in decision.hits if h.action == "flag_for_approval"])
-        return False
+        resume = interrupt({"kind": "output_approval", "token": state.approval_token,
+                            "draft": state.draft.model_dump() if state.draft else None})
+        payload = resume if isinstance(resume, dict) else {"decision": str(resume)}
+        if payload.get("decision") == "reject":
+            state.error = "rejected_by_user"
+            state.requires_approval = False
+            await save_plan(state)
+            return False
+        if payload.get("decision") == "edit" and payload.get("edited_draft"):
+            state.draft = DraftResponse.model_validate(payload["edited_draft"])
+        state.requires_approval = False
+        return True  # approved/edited: continue to confidence scoring
     return True
 
 # ============================================================

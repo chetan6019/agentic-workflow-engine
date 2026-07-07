@@ -97,6 +97,42 @@ async def test_stream_result_immediate_when_phase_key_expired(client, backend, a
     assert "event: phase" not in body
 
 
+async def test_workflow_pause_writes_awaiting_approval_phase(backend, monkeypatch):
+    """A run that interrupts for HITL must surface '🛑 awaiting approval' with
+    done=true (same wire behavior as before the native-interrupt migration) and
+    must NOT persist the pre-pause state, save a message, or discard the thread."""
+    from app.api import invoke as invoke_mod
+    from app.core.state import AgentState
+
+    class FakePausingCompiled:
+        async def astream(self, initial, config=None, stream_mode=None):
+            yield initial.model_dump()
+            yield {"__interrupt__": (object(),)}
+
+    saved: list = []
+    discarded: list = []
+
+    async def fake_save_plan(state):
+        saved.append(state)
+
+    async def fake_discard(trace_id):
+        discarded.append(trace_id)
+
+    monkeypatch.setattr(invoke_mod, "compile_graph", lambda: FakePausingCompiled())
+    monkeypatch.setattr(invoke_mod, "save_plan", fake_save_plan)
+    monkeypatch.setattr(invoke_mod, "discard_thread", fake_discard)
+
+    state = AgentState(trace_id="t-pause", user_id="user-1", session_id="s",
+                       user_request="do a thing")
+    await invoke_mod._run_workflow_with_phase(state)
+
+    phase = json.loads(backend.redis.kv["phase:t-pause"])
+    assert phase["done"] is True
+    assert "awaiting approval" in phase["phase"]
+    assert saved == []       # the paused node persisted its own state; don't clobber
+    assert discarded == []   # the checkpoint is the resume source — keep it
+
+
 def test_cors_allows_web_origins():
     cors = next(m for m in app.user_middleware if m.cls is CORSMiddleware)
     origins = cors.kwargs["allow_origins"]

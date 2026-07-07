@@ -45,6 +45,15 @@ class PlanStep(BaseModel):
     depends_on: list[str] = Field(
         default_factory=list, description="IDs of steps that must complete before this one."
     )
+    # Default "high" keeps legacy persisted state_json (written before this field
+    # existed) rebuilding with unchanged behavior — only plans where the planner
+    # actively signals doubt route through the pre-execution confidence gate.
+    confidence: Literal["high", "medium", "low"] = Field(
+        default="high",
+        description="Planner's self-rated certainty that this step is what the user wants: "
+        "high = routine read or clearly specified write; medium = ambiguous arguments or "
+        "inferred intent; low = guessing.",
+    )
 
 
 class ExecutionPlan(BaseModel):
@@ -137,6 +146,11 @@ class AgentState(BaseModel):
     confidence: float = Field(default=0.0, ge=0.0, le=1.0, description="Guard-computed confidence.")
     requires_approval: bool = Field(default=False, description="Whether HITL is required.")
     approval_token: str | None = Field(default=None, description="Token issued for HITL resume.")
+    plan_approved: bool = Field(
+        default=False,
+        description="Set after the plan-stage HITL gate approves; keeps the replan loop "
+        "and interrupt replays from pausing an already-approved plan again.",
+    )
     retry_count: int = Field(default=0, ge=0, description="Number of planner retries used.")
     error: str | None = Field(default=None, description="Terminal error code if any.")
     phase: Literal["entry", "execute", "finalize", "noop", "error"] = Field(

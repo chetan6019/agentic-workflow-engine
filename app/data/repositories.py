@@ -167,6 +167,22 @@ async def create_approval(trace_id: str, hours: int = 24) -> str:
         return token
 
 
+async def get_or_create_approval(trace_id: str, hours: int = 24) -> str:
+    """Return the existing UNDECIDED approval token for this trace, or create one.
+
+    interrupt() replays the paused node from the top on resume, so the pause path
+    runs twice per approval — this must never mint a second token for the same run.
+    """
+    async with get_async_session() as s:
+        row = (await s.execute(
+            select(Approval).where(Approval.trace_id == trace_id,
+                                   Approval.decision.is_(None))
+        )).scalars().first()
+        if row:
+            return row.token
+    return await create_approval(trace_id, hours)
+
+
 async def get_approval_by_token(token: str) -> dict[str, Any] | None:
     """Fetch approval row by token or return None."""
     async with get_async_session() as s:

@@ -17,6 +17,7 @@ from app.core.background import drain, spawn
 from app.data.db import get_engine, init_db
 from app.data.redis_client import check_rate_limit, get_redis
 from app.logging import configure_logging
+from app.orchestration.graph import close_checkpointer, init_checkpointer
 from app.rag.embedder import warmup_embedder
 from app.rag.qdrant_client import get_qdrant
 from app.security.jwt_tokens import decode_access_token
@@ -36,6 +37,7 @@ async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Create DB schema, then serve immediately while warming models in the background."""
     configure_logging()
     await init_db()
+    await init_checkpointer()  # after init_db: needs Postgres up when backend=postgres
     # Warm the in-process embedding models OFF the boot path so the api comes up
     # instantly. They load concurrently in the background; the only cost is that a
     # query arriving in the first few seconds may still pay the cold-start once.
@@ -57,7 +59,8 @@ async def _warmup() -> None:
 async def _shutdown() -> None:
     """Drain in-flight background runs, then close DB / Redis / Qdrant cleanly."""
     await drain(_SHUTDOWN_GRACE_SEC)
-    for name, closer in (("engine", get_engine().dispose),
+    for name, closer in (("checkpointer", close_checkpointer),
+                         ("engine", get_engine().dispose),
                          ("redis", get_redis().aclose),
                          ("qdrant", get_qdrant().close)):
         try:

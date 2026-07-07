@@ -64,6 +64,8 @@ class _Policy(NamedTuple):
     github_body_cfg: dict[str, object]
     finnhub_cfg: dict[str, object]
     trusted_read_actions: set[str]
+    # Planner-confidence gate level: "medium" (gate medium+low), "low", or "off".
+    confidence_gate_threshold: str
     # Writes that already executed before the OUTPUT guard runs; the citation scan must not gate them.
     executed_write_actions: set[str]
 
@@ -87,6 +89,7 @@ def _policy() -> _Policy:
         finnhub_cfg=dict(raw.get("finnhub") or {}),
         trusted_read_actions=set(raw.get("trusted_read_actions") or []),
         executed_write_actions=set(raw.get("executed_write_actions") or []),
+        confidence_gate_threshold=str(raw.get("confidence_gate_threshold", "medium")),
     )
 
 
@@ -98,6 +101,20 @@ def approval_required_actions() -> set[str]:
     One policy list, two enforcement points — keep them reading the same source.
     """
     return _policy().approval_actions
+
+
+def trusted_read_actions() -> set[str]:
+    """Public view of policy.yaml's trusted_read_actions ("tool.action" keys).
+
+    Used by the orchestrator's confidence gate: reads on trusted sources never
+    pause on low planner confidence — only writes and untrusted reads do.
+    """
+    return _policy().trusted_read_actions
+
+
+def confidence_gate_threshold() -> str:
+    """Policy knob for the pre-execution confidence gate: "medium" | "low" | "off"."""
+    return _policy().confidence_gate_threshold
 
 
 async def _incr(key: str, amount: int, ttl: int) -> int:
