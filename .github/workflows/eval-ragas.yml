@@ -14,10 +14,21 @@ on:
       - "scripts/eval/**"
   workflow_dispatch: {}
 
+# Least-privilege default; the job below widens only what the PR-comment step needs.
+permissions:
+  contents: read
+
 jobs:
   eval-ragas:
     runs-on: ubuntu-latest
     timeout-minutes: 20
+    # "Comment score table on PR" uses github.rest.issues.createComment against a PR,
+    # which the REST API accepts under either issues:write or pull-requests:write — the
+    # repo's default GITHUB_TOKEN scope didn't include either, causing a 403 "Resource
+    # not accessible by integration". pull-requests:write is the precise scope for this.
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v5
