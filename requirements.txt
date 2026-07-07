@@ -13,10 +13,11 @@ langchain
 langgraph
 langchain-openai
 langchain-mcp-adapters
-# Local-embeddings extras (only needed when EMBEDDING_PROVIDER=hf — pulls in torch,
-# ~2-3GB). Default path uses the LiteLLM proxy, so these are left out of the image.
-langchain-huggingface
-sentence-transformers
+# Local-embeddings extras (langchain-huggingface, sentence-transformers, torch) live in
+# requirements-hf.txt, not here — only needed when EMBEDDING_PROVIDER=hf (default is
+# "openai" via the LiteLLM proxy). Keeping the ~2-3GB torch download out of the base
+# install means CI/Docker builds never touch PyTorch's CDN, which has intermittent SSL
+# handshake failures on some networks/runners.
 
 # MCP servers
 fastmcp
@@ -55,8 +56,3 @@ pytest-asyncio
 
 prometheus-client
 litellm==1.89.0
-
-# Install CPU only PyTorch
-#--find-links https://download.pytorch.org/whl/torch_stable.html
---extra-index-url https://download.pytorch.org/whl/cpu
-torch==2.12.1+cpu
