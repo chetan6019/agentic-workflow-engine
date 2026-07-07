@@ -4,7 +4,7 @@
 fastapi
 uvicorn[standard]
 streamlit
-httpx
+httpx2
 pydantic
 pydantic-settings
 

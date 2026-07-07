@@ -1,6 +1,6 @@
 """Planner plan-validation tests (REVIEW.md R32).
 
-planner_node is driven with fetch_tool_specs, _invoke_planner, and get_settings
+planner_node is driven with fetch_tool_specs, call_planner_llm, and get_settings
 faked, so the validate → correct-once → fail-honestly path runs with no LLM,
 Qdrant, or settings file.
 """
@@ -48,28 +48,28 @@ def wire(monkeypatch):
             return plans.pop(0)
 
         monkeypatch.setattr(planner, "fetch_tool_specs", fake_specs)
-        monkeypatch.setattr(planner, "_invoke_planner", fake_invoke)
+        monkeypatch.setattr(planner, "call_planner_llm", fake_invoke)
         return invoked
 
     return configure
 
 
-# ── _invalid_steps (pure) ────────────────────────────────────────────────────
+# ── find_invalid_plan_steps (pure) ───────────────────────────────────────────
 
 
 def test_invalid_steps_accepts_known_pair():
-    assert planner._invalid_steps(_plan("gmail", "send_email"),
-                                  [_spec("send_email", "gmail")]) == []
+    assert planner.find_invalid_plan_steps(_plan("gmail", "send_email"),
+                                           [_spec("send_email", "gmail")]) == []
 
 
 def test_invalid_steps_accepts_swapped_pair():
     # MCP client resolves swapped server/action, so validation tolerates it.
-    assert planner._invalid_steps(_plan("send_email", "gmail"),
-                                  [_spec("send_email", "gmail")]) == []
+    assert planner.find_invalid_plan_steps(_plan("send_email", "gmail"),
+                                           [_spec("send_email", "gmail")]) == []
 
 
 def test_invalid_steps_flags_unknown_action():
-    bad = planner._invalid_steps(_plan("gmail", "teleport"), [_spec("send_email", "gmail")])
+    bad = planner.find_invalid_plan_steps(_plan("gmail", "teleport"), [_spec("send_email", "gmail")])
     assert bad == ["s1:gmail/teleport"]
 
 
@@ -91,7 +91,7 @@ async def test_invalid_plan_is_corrected_on_retry(wire):
     assert state.error is None
     assert state.plan.steps[0].action == "send_email"
     assert len(invoked) == 2
-    assert "<correction>" in invoked[1][-1].content  # feedback appended
+    assert "s1:gmail/bogus" in invoked[1][-1].content  # feedback names the bad step
 
 
 async def test_still_invalid_after_retry_sets_error(wire):

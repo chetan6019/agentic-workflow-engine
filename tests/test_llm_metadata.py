@@ -13,6 +13,7 @@ import pytest
 
 from app.core.state import AgentState
 from app.llm import client as llm_client
+from app.prompts import PROMPT_VERSION
 
 
 @pytest.fixture(autouse=True)
@@ -32,7 +33,9 @@ def test_metadata_builds_langfuse_grouping_body():
     llm = llm_client.get_llm(
         "composer", {"trace_id": "t1", "session_id": "s1", "user_id": "u1"})
     assert llm.extra_body == {
-        "metadata": {"generation_name": "composer", "tags": ["role:composer"],
+        "metadata": {"generation_name": "composer",
+                     "tags": ["role:composer", f"prompt_version:{PROMPT_VERSION}"],
+                     "prompt_version": PROMPT_VERSION,
                      "trace_id": "t1", "session_id": "s1", "trace_user_id": "u1"},
         "user": "u1",
     }
