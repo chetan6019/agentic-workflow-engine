@@ -75,8 +75,11 @@ litellm_settings:
   # NOTE: on some LiteLLM builds the Prometheus exporter is gated behind a LiteLLM key; if the
   # proxy logs that prometheus is unavailable, the app's RED metrics still work — only the
   # spend panels stay empty until a key is supplied.
-  success_callback: ["langfuse", "prometheus"]
-  failure_callback: ["langfuse", "prometheus"]
+  # "otel" exports each proxied LLM call as an OTLP span to the collector named by
+  # OTEL_EXPORTER_OTLP_ENDPOINT (Grafana Alloy), joining the app's run trace.
+  # "langfuse" stays until the OTLP→Langfuse path is verified end-to-end.
+  success_callback: ["langfuse", "prometheus", "otel"]
+  failure_callback: ["langfuse", "prometheus", "otel"]
   # Response caching. Same pitfall as callbacks above: this must live under
   # litellm_settings as cache/cache_params — a top-level `cache:` key is
   # silently ignored by the proxy. One flat TTL: per-model TTL maps are not
@@ -119,6 +122,8 @@ router_settings:
     - guard-judge: ["gemini-fallback", "openai-fallback"]
 
 environment_variables:
+  # Where the "otel" callback ships spans (set in docker-compose to http://alloy:4318).
+  OTEL_EXPORTER_OTLP_ENDPOINT: os.environ/OTEL_EXPORTER_OTLP_ENDPOINT
   LANGFUSE_PUBLIC_KEY: os.environ/LANGFUSE_PUBLIC_KEY
   LANGFUSE_SECRET_KEY: os.environ/LANGFUSE_SECRET_KEY
   LANGFUSE_HOST: os.environ/LANGFUSE_HOST

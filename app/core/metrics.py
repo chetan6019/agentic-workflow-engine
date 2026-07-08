@@ -37,35 +37,9 @@ workflow_run_latency_seconds: Histogram = Histogram(
     buckets=_LATENCY_BUCKETS,
 )
 
-# Per-orchestration-node latency (node = "planner" | "guardrails" | "orchestrator").
-node_latency_seconds: Histogram = Histogram(
-    "node_latency_seconds",
-    "Per-orchestration-node latency in seconds.",
-    ["node"],
-    buckets=_LATENCY_BUCKETS,
-)
-
-# Per-MCP-tool-call latency. ``server`` is the MCP key (google/github/reddit/finnhub);
-# ``ok`` is "true"/"false" so the error rate per server is derivable from _count.
-mcp_tool_latency_seconds: Histogram = Histogram(
-    "mcp_tool_latency_seconds",
-    "MCP tool-call latency in seconds, by server and ok flag.",
-    ["server", "ok"],
-    buckets=_LATENCY_BUCKETS,
-)
-
-# ---- HTTP-level RED metric (every route, every status) ----
-# Complements workflow_run_latency_seconds (which times the agent pipeline only):
-# this one captures the full HTTP request lifetime — including auth, validation,
-# rate limits, and SSE streams — across every route, not just /v1/invoke.
-# Buckets are tighter than _LATENCY_BUCKETS because most HTTP calls are sub-second.
-_HTTP_BUCKETS = (0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0)
-request_duration_seconds: Histogram = Histogram(
-    "request_duration_seconds",
-    "Server-side HTTP request duration in seconds, by route, method, and status.",
-    ["route", "method", "status"],
-    buckets=_HTTP_BUCKETS,
-)
+# node_latency_seconds / mcp_tool_latency_seconds / request_duration_seconds removed —
+# these latencies now come from OTel spans (node spans, mcp.tool_call spans, and
+# FastAPI auto-instrumentation), derived to Prometheus by the collector.
 
 # ---- Per-role LLM token + cost counters ----
 # App-side fallback for LiteLLM's proxy /metrics (which on some builds is gated

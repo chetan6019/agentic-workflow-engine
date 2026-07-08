@@ -43,6 +43,11 @@ python-jose[cryptography]
 # Observability
 structlog
 langfuse
+# OpenTelemetry: single emission path for traces (exported over OTLP to Grafana
+# Alloy, which fans out to Langfuse/Prometheus). See app/core/tracing.py.
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-http
+opentelemetry-instrumentation-fastapi
 
 # Utilities
 tenacity
@@ -56,3 +61,9 @@ pytest-asyncio
 
 prometheus-client
 litellm==1.89.0
+
+langchain-huggingface
+sentence-transformers
+
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.12.1+cpu

@@ -78,6 +78,8 @@ services:
       # DEBUG dumps full request/response blobs on every call — keep INFO unless
       # actively debugging LiteLLM internals.
       LITELLM_LOG: DEBUG
+      # The "otel" callback in infra/litellm_config.yaml ships LLM-call spans here.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
     depends_on: [postgres, redis]
 
   # STALE (2026-06-22): the four service blocks below (mcp-calendar/gmail/notion/slack) are
@@ -228,6 +230,9 @@ services:
       MCP_REDDIT_URL: http://mcp-reddit:7006
       MCP_GITHUB_URL: http://mcp-github:7007
       MCP_GOOGLE_URL: http://mcp-google:7008
+      # OTel spans go to Alloy (the collector); unset = tracing disabled.
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      OTEL_SERVICE_NAME: api
       TZ: ${TZ:-UTC}
       SERVICE_NAME: api
     depends_on:
@@ -277,6 +282,14 @@ services:
   # and infra/grafana/ for scrape + provisioning config.
   prometheus:
     image: prom/prometheus:latest
+    # Explicit command because --web.enable-remote-write-receiver is needed for
+    # Alloy's span-derived metrics (prometheus.remote_write in config.alloy);
+    # the first two flags restore the image's defaults, which an explicit
+    # command otherwise replaces.
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+      - "--web.enable-remote-write-receiver"
     ports: ["9090:9090"]
     volumes:
       - "./infra/prometheus.yml:/etc/prometheus/prometheus.yml:ro"
@@ -325,7 +338,11 @@ services:
       - "--server.http.listen-addr=0.0.0.0:12345"
       - "--storage.path=/var/lib/alloy/data"
       - "/etc/alloy/config.alloy"
-    ports: ["12345:12345"]
+    # .env supplies LANGFUSE_HOST + LANGFUSE_OTEL_AUTH for the OTLP→Langfuse exporter.
+    env_file: .env
+    # 4317/4318 published so a host-run `uvicorn` (local dev) can also export OTLP;
+    # compose containers reach alloy:4318 directly.
+    ports: ["12345:12345", "4317:4317", "4318:4318"]
     volumes:
       - "./infra/alloy/config.alloy:/etc/alloy/config.alloy:ro"
       # Persist Alloy's positions cursor across restarts so tailing resumes where

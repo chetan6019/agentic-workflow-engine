@@ -80,6 +80,12 @@ class Settings(BaseSettings):
     # Hard ceiling on a single workflow run; a run exceeding it is marked
     # run_timeout instead of hanging forever. Override with RUN_TIMEOUT_SEC.
     run_timeout_sec: int = 120
+    # OTLP endpoint spans are exported to (e.g. http://alloy:4318). None = tracing
+    # disabled: spans become no-ops, so tests/CI/bare dev need no collector.
+    otel_exporter_otlp_endpoint: str | None = None
+    # service.name resource attribute on exported spans (also set per-container
+    # via the SERVICE_NAME env in docker-compose.yml).
+    otel_service_name: str = "api"
 
     # ── New MCP servers: google / github / reddit / finnhub migration ────────
     # STALE (2026-06-22) context: mcp_calendar_url / mcp_gmail_url above stay required for

@@ -6,10 +6,10 @@ import asyncio
 import hashlib
 import json
 import time
-from functools import lru_cache
 from typing import Any
 
 import structlog
+from opentelemetry import trace
 from pydantic import BaseModel, ConfigDict, Field
 from qdrant_client.http.models import (
     FieldCondition,
@@ -32,6 +32,8 @@ from app.rag.embedder import embed_sparse, embed_text, rerank_scores
 from app.rag.qdrant_client import DENSE_VECTOR, SPARSE_VECTOR, get_qdrant
 
 log = structlog.get_logger(__name__)
+# No-op tracer unless app/core/tracing.py configured a provider at startup.
+_tracer = trace.get_tracer(__name__)
 _PLANS_COLLECTION = "plans"
 _SEARCH_K = 10
 _TOP_N = 3
@@ -68,46 +70,7 @@ class _GraderOutput(BaseModel):
     hits: list[_GradedHit] = Field(description="Per-candidate grades.")
 
 
-@lru_cache(maxsize=1)
-def _langfuse_client() -> Any | None:
-    """Lazily build a Langfuse client; None if the SDK or config is unavailable."""
-    try:
-        from langfuse import Langfuse
-
-        return Langfuse()
-    except Exception:
-        return None
-
-
-def _emit_retrieval_event(state: AgentState, query: str, fetched: list[RetrievedPlan],
-                          kept: list[RetrievedPlan], elapsed_ms: int) -> None:
-    """Best-effort: attach a retrieval event to the run's Langfuse trace.
-
-    Without this, Langfuse traces show only the LLM generations — what Qdrant
-    actually returned is invisible, so "bad retrieval vs bad generation" can't be
-    debugged from a trace. Mirrors the guardrails engine's best-effort pattern:
-    skipped when keys aren't configured, never run-fatal.
-    """
-    # getattr: tests stub get_settings() with a minimal namespace lacking these keys.
-    settings = get_settings()
-    if not (getattr(settings, "langfuse_public_key", None)
-            and getattr(settings, "langfuse_secret_key", None)):
-        return
-    client = _langfuse_client()
-    if client is None:
-        return
-    try:
-        client.create_event(
-            trace_context={"trace_id": state.trace_id},
-            name="retrieval",
-            input={"query": query},
-            output=[{"plan_id": p.plan_id, "similarity": round(p.similarity, 3),
-                     "fused_score": round(p.fused_score, 3)} for p in kept],
-            metadata={"collection": _PLANS_COLLECTION, "fetched": len(fetched),
-                      "kept": len(kept), "latency_ms": elapsed_ms},
-        )
-    except Exception as exc:
-        log.debug("retrieve_langfuse_failed", error=str(exc))
+# Custom Langfuse retrieval-event code removed — OTel spans below carry this now.
 
 
 def _estimate_tokens(plans: list[RetrievedPlan]) -> int:
@@ -228,13 +191,16 @@ async def _dense_only_search(
 ) -> list[RetrievedPlan]:
     """Plain cosine search against the dense named vector (hybrid disabled or fallback)."""
     t0 = time.monotonic()
-    hits = (await get_qdrant().query_points(
-        collection_name=_PLANS_COLLECTION,
-        query=vec,
-        using=DENSE_VECTOR,
-        query_filter=qfilter,
-        limit=k,
-    )).points
+    with _tracer.start_as_current_span("retrieve.search") as span:
+        span.set_attribute("search.mode", "dense")
+        hits = (await get_qdrant().query_points(
+            collection_name=_PLANS_COLLECTION,
+            query=vec,
+            using=DENSE_VECTOR,
+            query_filter=qfilter,
+            limit=k,
+        )).points
+        span.set_attribute("search.hits", len(hits))
     raw = [_to_plan(h, float(getattr(h, "score", 0.0)), float(getattr(h, "score", 0.0)))
            for h in hits]
     plans = [p for p in raw if p is not None]
@@ -250,36 +216,41 @@ async def _search(query: str, filters: dict[str, Any] | None, k: int = _SEARCH_K
     cosine (sourced from a parallel dense pass) so the guardrails confidence math stays
     in cosine space.
     """
-    vec = await embed_text(query)
+    with _tracer.start_as_current_span("retrieve.embed"):
+        vec = await embed_text(query)
     qfilter = _build_filter(filters)
     if not get_settings().hybrid_search_enabled:
         return await _dense_only_search(vec, qfilter, k)
 
     t0 = time.monotonic()
-    sparse = await embed_sparse(query)
+    with _tracer.start_as_current_span("retrieve.embed_sparse"):
+        sparse = await embed_sparse(query)
     t1 = time.monotonic()
     client = get_qdrant()
     # The RRF-fused pass and the cosine-recovery dense pass are independent, so
     # run them concurrently — one Qdrant round-trip of latency instead of two.
     # (RRF drops per-vector scores, hence the separate dense pass for cosine.)
-    fused_resp, dense_resp = await asyncio.gather(
-        client.query_points(
-            collection_name=_PLANS_COLLECTION,
-            prefetch=[
-                Prefetch(query=vec, using=DENSE_VECTOR, filter=qfilter, limit=k),
-                Prefetch(query=sparse, using=SPARSE_VECTOR, filter=qfilter, limit=k),
-            ],
-            query=FusionQuery(fusion=Fusion.RRF),
-            limit=k,
-        ),
-        client.query_points(
-            collection_name=_PLANS_COLLECTION,
-            query=vec,
-            using=DENSE_VECTOR,
-            query_filter=qfilter,
-            limit=k,
-        ),
-    )
+    with _tracer.start_as_current_span("retrieve.search") as span:
+        span.set_attribute("search.mode", "hybrid")
+        fused_resp, dense_resp = await asyncio.gather(
+            client.query_points(
+                collection_name=_PLANS_COLLECTION,
+                prefetch=[
+                    Prefetch(query=vec, using=DENSE_VECTOR, filter=qfilter, limit=k),
+                    Prefetch(query=sparse, using=SPARSE_VECTOR, filter=qfilter, limit=k),
+                ],
+                query=FusionQuery(fusion=Fusion.RRF),
+                limit=k,
+            ),
+            client.query_points(
+                collection_name=_PLANS_COLLECTION,
+                query=vec,
+                using=DENSE_VECTOR,
+                query_filter=qfilter,
+                limit=k,
+            ),
+        )
+        span.set_attribute("search.hits", len(fused_resp.points))
     t2 = time.monotonic()
     cosine = {str(getattr(h, "id", "")): float(getattr(h, "score", 0.0))
               for h in dense_resp.points}
@@ -305,14 +276,16 @@ async def _rerank(query: str, candidates: list[RetrievedPlan]) -> list[Retrieved
     """
     if not get_settings().rerank_enabled or not candidates:
         return candidates
-    # Score against the human-readable summary, falling back to the raw request text.
-    docs = [c.summary or c.request_text for c in candidates]
-    scores = await rerank_scores(query, docs)
-    paired = list(zip(scores, candidates))
-    paired.sort(key=lambda sc: sc[0], reverse=True)
-    log.info("retrieve_reranked",
-             scores=[{"plan_id": c.plan_id, "score": round(s, 3)} for s, c in paired])
-    return [c for _, c in paired[:_RERANK_TOP_N]]
+    with _tracer.start_as_current_span("retrieve.rerank") as span:
+        span.set_attribute("rerank.candidates", len(candidates))
+        # Score against the human-readable summary, falling back to the raw request text.
+        docs = [c.summary or c.request_text for c in candidates]
+        scores = await rerank_scores(query, docs)
+        paired = list(zip(scores, candidates))
+        paired.sort(key=lambda sc: sc[0], reverse=True)
+        log.info("retrieve_reranked",
+                 scores=[{"plan_id": c.plan_id, "score": round(s, 3)} for s, c in paired])
+        return [c for _, c in paired[:_RERANK_TOP_N]]
 
 
 async def _grade(candidates: list[RetrievedPlan], user_request: str,
@@ -320,12 +293,14 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str,
     """Ask the grader LLM to score candidates, drop ones below the threshold."""
     if not candidates:
         return []
-    msgs = build_retriever_grader_messages(query=user_request, candidates=candidates)
-    llm = get_structured_llm("retriever-grader", _GraderOutput, metadata)
-    try:
-        graded: _GraderOutput = await llm.ainvoke(msgs)
-    except Exception:
-        return candidates
+    with _tracer.start_as_current_span("retrieve.grade") as span:
+        span.set_attribute("grade.candidates", len(candidates))
+        msgs = build_retriever_grader_messages(query=user_request, candidates=candidates)
+        llm = get_structured_llm("retriever-grader", _GraderOutput, metadata)
+        try:
+            graded: _GraderOutput = await llm.ainvoke(msgs)
+        except Exception:
+            return candidates
     # Emit per-candidate relevance + rank so retrieval quality is observable
     # online (and joinable with feedback/eval offline — REVIEW.md R29). Ranked
     # by the grader's own score, highest first; threshold drives the keep set.
@@ -340,7 +315,13 @@ async def _grade(candidates: list[RetrievedPlan], user_request: str,
 
 async def retrieve(state: AgentState) -> list[RetrievedPlan]:
     """Run the agentic retrieval loop and return up to 5 graded RetrievedPlans."""
-    t0 = time.monotonic()
+    with _tracer.start_as_current_span("retrieve") as span:
+        span.set_attribute("run.trace_id", state.trace_id)
+        return await _retrieve_inner(state, span)
+
+
+async def _retrieve_inner(state: AgentState, span: trace.Span) -> list[RetrievedPlan]:
+    """Body of retrieve(), split out so the span wraps it without deep nesting."""
     meta = run_metadata(state)
     route = await _route_query(state, meta)
     if not route.should_retrieve:
@@ -372,6 +353,6 @@ async def retrieve(state: AgentState) -> list[RetrievedPlan]:
              post_retrieval_tokens=post_tokens,
              tokens_dropped=pre_tokens - post_tokens,
              fetched=len(fetched), kept=len(kept))
-    _emit_retrieval_event(state, route.query, fetched, kept,
-                          int((time.monotonic() - t0) * 1000))
+    span.set_attribute("retrieve.fetched", len(fetched))
+    span.set_attribute("retrieve.kept", len(kept))
     return kept

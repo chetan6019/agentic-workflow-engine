@@ -28,16 +28,20 @@ from zoneinfo import ZoneInfo
 import structlog
 from langchain_core.exceptions import OutputParserException
 from langchain_core.messages import HumanMessage
+from opentelemetry import trace
 from pydantic import ValidationError
 
 from app.config import get_settings
-from app.core.metrics import node_latency_seconds, planner_outcome_total
+# node_latency_seconds removed — node latency now comes from the OTel node span.
+from app.core.metrics import planner_outcome_total
 from app.core.state import AgentState, ExecutionPlan, ToolSpec
 from app.llm.client import call_metadata, get_structured_llm
 from app.prompts import build_planner_messages
 from app.rag.tool_docs import fetch_tool_specs
 
 log = structlog.get_logger(__name__)
+# No-op tracer unless app/core/tracing.py configured a provider at startup.
+_tracer = trace.get_tracer(__name__)
 
 # How many tool docs to fetch from the RAG layer for the planner prompt.
 # Small enough that the prompt stays compact across the four MCP servers,
@@ -259,16 +263,15 @@ async def planner_node(state: AgentState) -> AgentState:
     exception types are deliberately NOT caught; we want truly unexpected
     failures to propagate with their original traceback intact.
 
-    Latency is observed in a `finally` block so failed runs still contribute
-    to the histogram (otherwise p95 looks artificially good when the planner
-    is failing).
+    Node latency is captured by the OTel span wrapping the body (success and
+    failure paths alike).
     """
     with structlog.contextvars.bound_contextvars(
         trace_id=state.trace_id,
         user_id=state.user_id,
         session_id=state.session_id,
         node="planner",
-    ):
+    ), _tracer.start_as_current_span("node.planner"):
         start_time = time.monotonic()
         log.info(
             "planner_node_start",
@@ -337,10 +340,6 @@ async def planner_node(state: AgentState) -> AgentState:
             state.phase = "error"
             planner_outcome_total.labels(outcome="failed").inc()
             log.error("planner_node_failed", error=str(exc))
-        finally:
-            # Observe latency on BOTH success and failure paths so error
-            # latencies aren't silently excluded from the histogram.
-            duration = time.monotonic() - start_time
-            node_latency_seconds.labels(node="planner").observe(duration)
+        # node_latency_seconds observation removed — the OTel node span times this.
 
         return state

@@ -14,6 +14,7 @@ from app.api import approvals, auth, feedback, health, integrations, invoke, ses
 from app.api.middleware import RequestContextMiddleware, RequestDurationMiddleware
 from app.config import get_settings
 from app.core.background import drain, spawn
+from app.core.tracing import setup_tracing
 from app.data.db import get_engine, init_db
 from app.data.redis_client import check_rate_limit, get_redis
 from app.logging import configure_logging
@@ -121,6 +122,9 @@ def create_app() -> FastAPI:
     for router in [auth.router, invoke.router, sessions.router, approvals.router,
                    feedback.router, integrations.router, health.router]:
         app.include_router(router)
+
+    # OTel tracing (no-op unless OTEL_EXPORTER_OTLP_ENDPOINT is set).
+    setup_tracing(app)
 
     return app
 

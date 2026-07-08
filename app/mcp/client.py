@@ -12,6 +12,7 @@ import httpx
 import structlog
 from langchain_core.tools import BaseTool
 from langchain_mcp_adapters.client import MultiServerMCPClient
+from opentelemetry import trace
 from tenacity import (
     retry,
     retry_if_exception_type,
@@ -20,11 +21,13 @@ from tenacity import (
 )
 
 from app.config import get_settings
-from app.core.metrics import mcp_tool_latency_seconds
+# mcp_tool_latency_seconds removed — tool latency now comes from the OTel tool span.
 from app.core.state import ToolResult, ToolSpec
 from app.data.redis_client import get_redis
 
 log = structlog.get_logger(__name__)
+# No-op tracer unless app/core/tracing.py configured a provider at startup.
+_tracer = trace.get_tracer(__name__)
 _CACHE_TTL_SEC = 900
 _TRANSIENT_EXC: tuple[type[BaseException], ...] = (
     httpx.TimeoutException,
@@ -143,16 +146,23 @@ class MCPClient:
 
         log.info("mcp_tool_call_start", server=server, tool=tool, step=step_id)
         started = time.monotonic()
-        try:
-            raw = await _invoke()
-            result = _to_tool_result(step_id, raw, started)
-        except Exception as exc:
-            log.warning("mcp_tool_call_failed", server=server, tool=tool,
-                        step=step_id, error=str(exc))
-            result = _to_tool_result(step_id, None, started, error=str(exc))
+        # Span attributes carry identifiers only (never tool args/outputs — may hold PII).
+        with _tracer.start_as_current_span("mcp.tool_call") as span:
+            span.set_attribute("mcp.server", server)
+            span.set_attribute("mcp.tool", tool)
+            try:
+                raw = await _invoke()
+                result = _to_tool_result(step_id, raw, started)
+            except Exception as exc:
+                log.warning("mcp_tool_call_failed", server=server, tool=tool,
+                            step=step_id, error=str(exc))
+                result = _to_tool_result(step_id, None, started, error=str(exc))
+            span.set_attribute("mcp.ok", result.ok)
+            # getattr: tenacity attaches .statistics to the wrapped function at runtime,
+            # but its type stubs don't declare it.
+            stats = getattr(_invoke, "statistics", {})
+            span.set_attribute("mcp.retries", stats.get("attempt_number", 1) - 1)
 
-        mcp_tool_latency_seconds.labels(
-            server=server, ok=str(result.ok).lower()).observe(result.latency_ms / 1000)
         await redis.set(f"mcp:{key}", result.model_dump_json(), ex=_CACHE_TTL_SEC)
         log.info("mcp_tool_call_done", server=server, tool=tool, step=step_id,
                  ok=result.ok, latency_ms=result.latency_ms)

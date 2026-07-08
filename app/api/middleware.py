@@ -4,7 +4,7 @@ import uuid
 import structlog
 from starlette.middleware.base import BaseHTTPMiddleware
 
-from app.core.metrics import request_duration_seconds
+# request_duration_seconds removed — HTTP latency now comes from OTel FastAPI spans.
 
 log = structlog.get_logger(__name__)
 
@@ -32,17 +32,8 @@ class RequestContextMiddleware(BaseHTTPMiddleware):
 
 
 class RequestDurationMiddleware(BaseHTTPMiddleware):
-    """HTTP RED metric: observe duration per (route, method, status).
-
-    Kept separate from RequestContextMiddleware because the two have different
-    concerns: a metric observation failing should never disturb a logging concern,
-    and vice versa. Register BOTH in app/main.py (order doesn't matter — they
-    don't depend on each other).
-
-    `route` uses `request.url.path` because this codebase doesn't have path
-    parameters with high cardinality (UUIDs etc.) — if that ever changes, swap
-    to `request.scope["route"].path` to use the path TEMPLATE
-    (e.g. "/v1/runs/{id}") instead of the literal path.
+    """Access log per request. The RED latency histogram this middleware used to
+    observe was removed — HTTP durations now come from OTel FastAPI spans.
     """
 
     async def dispatch(self, request, call_next):
@@ -53,14 +44,8 @@ class RequestDurationMiddleware(BaseHTTPMiddleware):
             status = str(response.status_code)
             return response
         finally:
-            # `finally` so even uncaught exceptions still contribute a sample,
-            # otherwise error latencies are silently excluded from the histogram.
+            # `finally` so even uncaught exceptions still produce an access-log line.
             duration = time.monotonic() - start
-            request_duration_seconds.labels(
-                route=request.url.path,
-                method=request.method,
-                status=status,
-            ).observe(duration)
             # One access-log line per real request (probes/scrapes excluded) so
             # Loki always has a per-request signal, not only workflow-run events.
             if request.url.path not in _QUIET_PATHS:

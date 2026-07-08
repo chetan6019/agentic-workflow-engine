@@ -6,6 +6,7 @@ import asyncio
 import time
 
 import structlog
+from opentelemetry import trace
 
 import datetime
 from zoneinfo import ZoneInfo
@@ -13,7 +14,7 @@ from zoneinfo import ZoneInfo
 from app.agents.response_composer import compose
 from app.config import get_settings
 from app.core.background import spawn
-from app.core.metrics import node_latency_seconds
+# node_latency_seconds removed — node latency now comes from the OTel node span.
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
 from app.guardrails import approval_required_actions
@@ -22,6 +23,8 @@ from app.rag.indexer import index_plan
 from app.rag.retriever import retrieve
 
 log = structlog.get_logger(__name__)
+# No-op tracer unless app/core/tracing.py configured a provider at startup.
+_tracer = trace.get_tracer(__name__)
 
 # Actions gated for human approval BEFORE they run, so we never approve something that
 # already happened. The gated set is policy.yaml's approval_required_actions ("tool.action"
@@ -263,8 +266,7 @@ async def orchestrator_node(state: AgentState) -> AgentState:
         user_id=state.user_id,
         session_id=state.session_id,
         node="orchestrator",
-        
-    ):
+    ), _tracer.start_as_current_span("node.orchestrator"):
         if state.error:
             # A prior node (e.g. a failed planner) set an error; do no work — the router
             # ends the run. Guards against re-running the entry phase after planner failure.
@@ -287,5 +289,5 @@ async def orchestrator_node(state: AgentState) -> AgentState:
             result = state
         log.info("orchestrator_node_done", phase=phase,
                 duration_ms=int((time.monotonic() - t0) * 1000))
-        node_latency_seconds.labels(node="orchestrator").observe(time.monotonic() - t0)
+        # node_latency_seconds observation removed — the OTel node span times this.
         return result

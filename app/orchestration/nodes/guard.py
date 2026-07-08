@@ -8,10 +8,12 @@ from statistics import mean
 
 import structlog
 from langchain_core.exceptions import OutputParserException
+from opentelemetry import trace
 from pydantic import ValidationError
 
 from app.agents.response_composer import compose
-from app.core.metrics import guard_outcome_total, node_latency_seconds
+# node_latency_seconds removed — node latency now comes from the OTel node span.
+from app.core.metrics import guard_outcome_total
 from app.core.state import AgentState, DraftResponse, GuardVerdict
 from app.data.repositories import create_approval, get_token, save_plan
 from app.guardrails import evaluate_output
@@ -20,6 +22,8 @@ from app.prompts import build_guard_judge_messages
 from app.security.redaction import contains_pii
 
 log = structlog.get_logger(__name__)
+# No-op tracer unless app/core/tracing.py configured a provider at startup.
+_tracer = trace.get_tracer(__name__)
 
 # ============================================================
 # CONFIGURATION (tweak these to change behavior)
@@ -251,8 +255,7 @@ async def guardrails_node(state: AgentState) -> AgentState:
         user_id=state.user_id,
         session_id=state.session_id,
         node="guardrails",
-        
-    ):
+    ), _tracer.start_as_current_span("node.guardrails"):
         start = time.monotonic()
         log.info("guardrails_node_start", trace_id=state.trace_id)
 
@@ -302,10 +305,9 @@ async def guardrails_node(state: AgentState) -> AgentState:
             log.info("guard_awaiting_approval", trace_id=state.trace_id,
                     confidence=round(state.confidence, 3))
         
-        # Metrics
+        # node_latency_seconds observation removed — the OTel node span times this.
         duration_ms = int((time.monotonic() - start) * 1000)
-        node_latency_seconds.labels(node="guardrails").observe(time.monotonic() - start)
-        log.info("guardrails_node_done", 
+        log.info("guardrails_node_done",
                 confidence=round(state.confidence, 3),
                 verdict=state.verdict, 
                 requires_approval=state.requires_approval,

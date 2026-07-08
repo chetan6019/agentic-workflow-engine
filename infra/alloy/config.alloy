@@ -76,3 +76,63 @@ loki.write "default" {
     url = "http://loki:3100/loki/api/v1/push"
   }
 }
+
+// ── OpenTelemetry pipeline ────────────────────────────────────────────────────
+// The app (and the LiteLLM proxy's "otel" callback) export OTLP spans here.
+// Traces are forwarded to Langfuse; latency metrics are DERIVED from the same
+// spans (spanmetrics) and remote-written to Prometheus — this replaces the
+// node/tool/HTTP latency histograms the app used to maintain by hand.
+
+// 6. Receive OTLP from the compose network (app: http://alloy:4318).
+otelcol.receiver.otlp "default" {
+  grpc {
+    endpoint = "0.0.0.0:4317"
+  }
+  http {
+    endpoint = "0.0.0.0:4318"
+  }
+  output {
+    traces = [
+      otelcol.exporter.otlphttp.langfuse.input,
+      otelcol.connector.spanmetrics.default.input,
+    ]
+  }
+}
+
+// 7. Traces → Langfuse's native OTLP endpoint.
+//    LANGFUSE_OTEL_AUTH must hold "Basic <base64(public_key:secret_key)>".
+//    Both env vars come from .env via the alloy service's env_file.
+otelcol.exporter.otlphttp "langfuse" {
+  client {
+    endpoint = string.format("%s/api/public/otel", sys.env("LANGFUSE_HOST"))
+    headers = {
+      "Authorization" = sys.env("LANGFUSE_OTEL_AUTH"),
+    }
+  }
+}
+
+// 8. Derive request-rate/latency metrics from spans (RED without hand-rolled
+//    histograms). Series are named per span name, e.g. duration of
+//    "node.planner", "mcp.tool_call", "retrieve.search".
+otelcol.connector.spanmetrics "default" {
+  histogram {
+    explicit {
+      buckets = ["50ms", "100ms", "250ms", "500ms", "1s", "2s", "5s", "10s", "15s", "20s", "30s", "45s", "1m", "1m30s", "2m"]
+    }
+  }
+  output {
+    metrics = [otelcol.exporter.prometheus.default.input]
+  }
+}
+
+// 9. Span-derived metrics → Prometheus (needs --web.enable-remote-write-receiver
+//    on the prometheus service, set in docker-compose.yml).
+otelcol.exporter.prometheus "default" {
+  forward_to = [prometheus.remote_write.default.receiver]
+}
+
+prometheus.remote_write "default" {
+  endpoint {
+    url = "http://prometheus:9090/api/v1/write"
+  }
+}

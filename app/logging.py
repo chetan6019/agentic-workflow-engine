@@ -4,9 +4,27 @@ from __future__ import annotations
 
 import logging
 import sys
+from typing import Any, MutableMapping
 
 import structlog
+from opentelemetry import trace
 from structlog.typing import Processor
+
+
+def add_otel_trace_context(
+    logger: Any, method_name: str, event_dict: MutableMapping[str, Any]
+) -> MutableMapping[str, Any]:
+    """Copy the active OTel span's ids into the log line.
+
+    Keys are otel_trace_id / otel_span_id — NOT trace_id, which this app already
+    uses for the workflow-run UUID. When no span is active (tracing disabled,
+    startup code) the ids are invalid and nothing is added.
+    """
+    ctx = trace.get_current_span().get_span_context()
+    if ctx.is_valid:
+        event_dict["otel_trace_id"] = format(ctx.trace_id, "032x")
+        event_dict["otel_span_id"] = format(ctx.span_id, "016x")
+    return event_dict
 
 
 def configure_logging(level: str = "INFO") -> None:
@@ -15,6 +33,7 @@ def configure_logging(level: str = "INFO") -> None:
     # callables/instances to list[object] and rejects it at configure/formatter).
     shared_processors: list[Processor] = [
         structlog.contextvars.merge_contextvars,
+        add_otel_trace_context,
         structlog.stdlib.add_log_level,
         structlog.stdlib.add_logger_name,
         # utc=False emits the container's local time; set the container TZ via the
