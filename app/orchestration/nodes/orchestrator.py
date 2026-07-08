@@ -6,6 +6,8 @@ import asyncio
 import time
 
 import structlog
+from langgraph.errors import GraphInterrupt
+from langgraph.types import interrupt
 
 import datetime
 from zoneinfo import ZoneInfo
@@ -15,8 +17,14 @@ from app.config import get_settings
 from app.core.background import spawn
 from app.core.metrics import node_latency_seconds
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
-from app.data.repositories import create_approval, get_session, save_plan, save_tool_call
-from app.guardrails import approval_required_actions
+# STALE (2026-07-07): create_approval no longer imported — the interrupt()-based pause
+# uses get_or_create_approval so a resume replay can never mint a second token.
+from app.data.repositories import get_or_create_approval, get_session, save_plan, save_tool_call
+from app.guardrails import (
+    approval_required_actions,
+    confidence_gate_threshold,
+    trusted_read_actions,
+)
 from app.mcp.client import get_mcp_client
 from app.rag.indexer import index_plan
 from app.rag.retriever import retrieve
@@ -41,10 +49,41 @@ log = structlog.get_logger(__name__)
 # _APPROVAL_ACTIONS = {"delete_event", "delete_page"}
 
 
-def _needs_approval(steps: list[PlanStep]) -> bool:
-    """True if any plan step is an approval-gated write per policy.yaml (needs pre-approval)."""
+# Which planner confidence levels each policy threshold gates.
+_GATED_CONFIDENCE = {"medium": {"medium", "low"}, "low": {"low"}, "off": set()}
+
+
+def _steps_needing_approval(steps: list[PlanStep]) -> dict[str, str]:
+    """Map step_id -> reason ("policy" | "low_confidence") for steps that must pause.
+
+    A step pauses BEFORE execution when its tool.action is in policy.yaml's
+    approval_required_actions (any confidence), OR when the planner rated it
+    medium/low (per confidence_gate_threshold) AND it is not a trusted read —
+    reads on trusted sources never pause on confidence alone (rule 6 carve-out).
+    """
     gated = approval_required_actions()
-    return any(f"{s.tool}.{s.action}" in gated for s in steps)
+    trusted = trusted_read_actions()
+    levels = _GATED_CONFIDENCE.get(confidence_gate_threshold(), {"medium", "low"})
+    reasons: dict[str, str] = {}
+    for s in steps:
+        key = f"{s.tool}.{s.action}"
+        if key in gated:
+            reasons[s.id] = "policy"
+        elif s.confidence in levels and key not in trusted:
+            reasons[s.id] = "low_confidence"
+    if reasons:
+        # debug, not info: callers may evaluate this more than once per pause.
+        log.debug("pre_execution_gate", reasons=reasons)
+    return reasons
+
+
+def _needs_approval(steps: list[PlanStep]) -> bool:
+    """True if any plan step must pause for approval before execution."""
+    # STALE (2026-07-07): direct policy-set check superseded by _steps_needing_approval,
+    # which adds the planner-confidence gate. Kept as a thin wrapper for callers/tests.
+    # gated = approval_required_actions()
+    # return any(f"{s.tool}.{s.action}" in gated for s in steps)
+    return bool(_steps_needing_approval(steps))
 
 
 def _conflict_result(results: list[ToolResult]) -> ToolResult | None:
@@ -80,17 +119,23 @@ def _fmt_day(ts: str) -> str:
         return ts
 
 
-def _approval_draft(plan: ExecutionPlan) -> DraftResponse:
+def _approval_draft(plan: ExecutionPlan,
+                    reasons: dict[str, str] | None = None) -> DraftResponse:
     """Deterministic approval draft listing the changes awaiting human approval.
 
     Built from plan-step arguments only (no LLM), so the user sees exactly what they
     are approving before any tool runs — at this point no composed draft exists yet.
+    ``reasons`` is _steps_needing_approval's map; when omitted it is recomputed.
     """
+    if reasons is None:
+        reasons = _steps_needing_approval(plan.steps)
     items: list[str] = []
-    gated = approval_required_actions()
+    low_conf_steps: list[PlanStep] = []
     for s in plan.steps:
-        if f"{s.tool}.{s.action}" not in gated:
+        if s.id not in reasons:
             continue
+        if reasons[s.id] == "low_confidence":
+            low_conf_steps.append(s)
         a = s.arguments
         if s.action == "send_email":
             subj = a.get("subject")
@@ -111,10 +156,17 @@ def _approval_draft(plan: ExecutionPlan) -> DraftResponse:
             continue
         items.append(f"{verb} {target}")
     joined = ", and ".join(items) or "the requested change"
+    detail = f"⚠️ This will {joined}.\n\n"
+    if low_conf_steps:
+        lines = "\n".join(
+            f"- `{s.tool}.{s.action}` — the planner was not fully sure this is what "
+            f"you meant ({s.confidence} confidence)" for s in low_conf_steps)
+        detail += ("**Why am I being asked?** One or more steps were rated below "
+                   f"high confidence:\n{lines}\n\n")
+    detail += "**Approve** to proceed, or **Reject** to cancel."
     return DraftResponse(
         summary=f"Approval needed to {joined}.",
-        detail_markdown=(f"⚠️ This will {joined}.\n\n"
-                         f"**Approve** to proceed, or **Reject** to cancel."),
+        detail_markdown=detail,
         actions_taken=[], actions_pending=[f"Awaiting approval to {joined}"], citations=[])
 
 
@@ -194,53 +246,106 @@ async def _run_entry(state: AgentState) -> AgentState:
     return state
 
 
+async def _pause_for_approval(state: AgentState, draft: DraftResponse, kind: str) -> dict:
+    """Persist the approval context, then interrupt() the graph until a human decides.
+
+    First pass: interrupt() RAISES, the run pauses, and the checkpoint holds this
+    node's input. The draft/token written to Postgres here is what the UI shows.
+    Resume: LangGraph REPLAYS this node from the top, this function runs again
+    (side effects must be — and are — idempotent: save_plan upserts,
+    get_or_create_approval never mints twice), and interrupt() RETURNS the
+    Command(resume=...) payload: {"decision": ..., "edited_draft": ...}.
+    """
+    state.requires_approval = True
+    if state.draft is None:
+        state.draft = draft
+    await save_plan(state)  # plans row must exist before the approvals FK insert
+    state.approval_token = await get_or_create_approval(state.trace_id)
+    await save_plan(state)  # persist token + draft so the approval card can render
+    log.info("orchestrator_awaiting_approval", trace_id=state.trace_id, kind=kind,
+             token=state.approval_token[:8] + "…")
+    resume = interrupt({"kind": kind, "token": state.approval_token,
+                        "draft": draft.model_dump()})
+    return resume if isinstance(resume, dict) else {"decision": str(resume)}
+
+
+def _apply_rebook(state: AgentState, conflict: ToolResult) -> None:
+    """Point the clashing calendar step at the approved suggested slot.
+
+    Clears tool_results/draft so the execute loop re-runs and books the new time.
+    (Moved here from app/api/approvals.py when resume switched to interrupt().)
+    """
+    sug = (conflict.output or {}).get("suggested") or {}
+    for step in (state.plan.steps if state.plan else []):
+        if step.id == conflict.step_id:
+            step.arguments["start"] = sug.get("start")
+            step.arguments["end"] = sug.get("end")
+    state.tool_results = []
+    state.draft = None
+
+
 async def _run_execute(state: AgentState) -> AgentState:
-    """Persist the plan, fan out tool calls in DAG order, then compose the draft."""
+    """Gate the plan, fan out tool calls in DAG order, then compose the draft.
+
+    Both HITL pauses (plan-stage gate, calendar-conflict rebook) use LangGraph's
+    native interrupt(); POST /v1/approvals/{token} resumes with Command(resume=...).
+    """
     assert state.plan is not None
-    # Update/delete steps mutate an existing resource and need approval BEFORE execution.
-    # Only flag when no token exists yet: once approved (token set, requires_approval
-    # cleared on resume) we fall through and execute instead of pausing again.
-    if _needs_approval(state.plan.steps) and not state.approval_token:
-        state.requires_approval = True
-    # HITL gate: if the user (or planner) requested approval and we haven't
-    # already issued a token, pause here BEFORE any tool runs.
-    if state.requires_approval and not state.approval_token:
-        await save_plan(state)  # plans row must exist before the approvals FK insert
-        state.approval_token = await create_approval(state.trace_id)
-        # Give the approval card something to show: describe the pending change(s).
-        # On resume the real composed draft replaces this after the tools run.
-        if state.draft is None and _needs_approval(state.plan.steps):
-            state.draft = _approval_draft(state.plan)
-        await save_plan(state)  # persist the issued token so resume can find it
-        log.info("orchestrator_awaiting_approval", trace_id=state.trace_id,
-                 token=state.approval_token[:8] + "…")
-        return state
+    # ── Plan-stage gate: pause BEFORE any tool runs (policy writes, low planner
+    # confidence, or an explicit require_approval request). plan_approved guards
+    # the replan loop and interrupt replays from re-pausing an approved plan.
+    gated = _steps_needing_approval(state.plan.steps)
+    if (gated or state.requires_approval) and not state.plan_approved:
+        resume = await _pause_for_approval(
+            state, _approval_draft(state.plan, gated), kind="plan_approval")
+        decision = resume.get("decision")
+        if decision == "reject":
+            state.error = "rejected_by_user"
+            state.requires_approval = False
+            await save_plan(state)
+            return state
+        if decision == "edit" and resume.get("edited_draft"):
+            state.draft = DraftResponse.model_validate(resume["edited_draft"])
+        state.requires_approval = False
+        state.plan_approved = True
     await save_plan(state)  # create the plans row so tool_calls FK is satisfied
     mcp = get_mcp_client()
     parallel = state.plan.strategy in {"parallel", "mixed"}
-    levels = _topo_levels(state.plan.steps)
-    log.info("orchestrator_execute_start", steps=len(state.plan.steps),
-             levels=len(levels), strategy=state.plan.strategy)
-    for i, level in enumerate(levels):
-        results = await _execute_level(level, mcp, parallel,
-                                       trace_id=state.trace_id, user_id=state.user_id)
-        for r in results:
-            state.tool_results.append(r)
-            await save_tool_call(state.trace_id, r)
-        log.debug("orchestrator_level_done", level=i,
-                  ok=sum(1 for r in results if r.ok), total=len(results))
-    # Calendar clash: the event was NOT created. If a free slot was found, pause for
-    # HITL approval so the user can confirm booking it; the graph routes to END here.
-    conflict = _conflict_result(state.tool_results)
-    if conflict is not None:
-        state.draft = _conflict_draft(conflict)
-        if (conflict.output or {}).get("suggested") and not state.approval_token:
-            state.approval_token = await create_approval(state.trace_id)
-            state.requires_approval = True
-            log.info("orchestrator_calendar_conflict_pause", trace_id=state.trace_id,
-                     token=state.approval_token[:8] + "…")
-        await save_plan(state)
-        return state
+    # Execute levels in a loop so an approved calendar rebook can clear results
+    # and run again with the new slot. Tool idempotency keys (R8) make any
+    # replayed step safe — unchanged inputs are deduplicated by the MCP client.
+    while True:
+        levels = _topo_levels(state.plan.steps)
+        log.info("orchestrator_execute_start", steps=len(state.plan.steps),
+                 levels=len(levels), strategy=state.plan.strategy)
+        for i, level in enumerate(levels):
+            results = await _execute_level(level, mcp, parallel,
+                                           trace_id=state.trace_id, user_id=state.user_id)
+            for r in results:
+                state.tool_results.append(r)
+                await save_tool_call(state.trace_id, r)
+            log.debug("orchestrator_level_done", level=i,
+                      ok=sum(1 for r in results if r.ok), total=len(results))
+        # Calendar clash: the event was NOT created.
+        conflict = _conflict_result(state.tool_results)
+        if conflict is None:
+            break
+        if not (conflict.output or {}).get("suggested"):
+            # No free slot found: report it as the final answer, nothing to approve.
+            state.draft = _conflict_draft(conflict)
+            await save_plan(state)
+            return state
+        # A free slot was suggested — pause for the user to confirm booking it.
+        resume = await _pause_for_approval(
+            state, _conflict_draft(conflict), kind="calendar_conflict")
+        if resume.get("decision") == "reject":
+            state.error = "rejected_by_user"
+            state.requires_approval = False
+            await save_plan(state)
+            return state
+        state.requires_approval = False
+        _apply_rebook(state, conflict)  # clears results/draft; loop re-executes
+        log.info("orchestrator_calendar_rebook", trace_id=state.trace_id)
     state.draft = await compose(state)
     await save_plan(state)  # persist the draft immediately so the result survives
     log.info("orchestrator_execute_done", tool_results=len(state.tool_results),
@@ -281,6 +386,10 @@ async def orchestrator_node(state: AgentState) -> AgentState:
                 result = await _run_finalize(state)
             else:
                 result = state
+        except GraphInterrupt:
+            # interrupt() pauses the run for HITL — LangGraph's machinery must see
+            # this, so it is NOT an orchestrator failure. Re-raise untouched.
+            raise
         except Exception as exc:
             log.exception("orchestrator_failed", phase=phase, error=str(exc))
             state.error = f"orchestrator_failed:{exc!s}"

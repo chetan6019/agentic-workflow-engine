@@ -127,8 +127,20 @@ def backend(monkeypatch) -> Backend:
             b.approvals[token]["decision"] = decision
 
     class FakeCompiled:
-        async def ainvoke(self, state: Any, config: Any = None) -> Any:
-            b.resumed.append(state)
+        async def aget_state(self, config: Any) -> Any:
+            # A paused thread always has a pending interrupted node in these tests.
+            from types import SimpleNamespace as _NS
+            return _NS(next=("orchestrator",))
+
+        async def ainvoke(self, cmd: Any, config: Any = None) -> Any:
+            # Resume arrives as Command(resume={"decision": ..., "edited_draft": ...}).
+            b.resumed.append(cmd)
+            from app.core.state import AgentState as _State
+            decision = (getattr(cmd, "resume", None) or {}).get("decision")
+            state = _State(trace_id=config["configurable"]["thread_id"],
+                           user_id="user-1", session_id="s", user_request="x")
+            if decision == "reject":
+                state.error = "rejected_by_user"
             return state.model_dump()
 
     async def discard(trace_id: str) -> None:

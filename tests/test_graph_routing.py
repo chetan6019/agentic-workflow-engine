@@ -15,6 +15,7 @@ from langgraph.graph import END
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.orchestration import graph
 from app.orchestration.nodes import guard
+from app.orchestration.nodes import orchestrator
 from app.orchestration.nodes.orchestrator import _approval_draft, _needs_approval, _topo_levels
 
 
@@ -213,3 +214,64 @@ def test_approval_draft_renders_every_gated_write():
     draft = _approval_draft(_plan(steps))
     assert "reddit: submit" in draft.summary
     assert "delete" in draft.summary
+
+
+# ── the planner-confidence gate (pre-execution, rule 6) ──────────────────────
+# Policy default confidence_gate_threshold=medium: medium/low non-trusted-read
+# steps pause; trusted reads never pause on confidence; policy actions always do.
+
+
+def _conf_step(tool: str, action: str, confidence: str) -> PlanStep:
+    return PlanStep(id="s1", tool=tool, action=action, arguments={},
+                    confidence=confidence)  # type: ignore[arg-type]
+
+
+def test_confidence_gate_pauses_medium_write():
+    reasons = orchestrator._steps_needing_approval(
+        [_conf_step("google", "send_email", "medium")])
+    assert reasons == {"s1": "low_confidence"}
+
+
+def test_confidence_gate_lets_high_write_through():
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("google", "send_email", "high")]) == {}
+
+
+def test_confidence_gate_never_pauses_trusted_reads():
+    # finnhub.get_quote is in policy trusted_read_actions — low confidence is fine.
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("finnhub", "get_quote", "low")]) == {}
+
+
+def test_policy_action_gates_even_at_high_confidence():
+    reasons = orchestrator._steps_needing_approval(
+        [_conf_step("google", "delete_event", "high")])
+    assert reasons == {"s1": "policy"}
+
+
+def test_confidence_gate_threshold_low_ignores_medium(monkeypatch):
+    monkeypatch.setattr(orchestrator, "confidence_gate_threshold", lambda: "low")
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("google", "send_email", "medium")]) == {}
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("google", "send_email", "low")]) == {"s1": "low_confidence"}
+
+
+def test_confidence_gate_threshold_off_only_policy_gates(monkeypatch):
+    monkeypatch.setattr(orchestrator, "confidence_gate_threshold", lambda: "off")
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("google", "send_email", "low")]) == {}
+    assert orchestrator._steps_needing_approval(
+        [_conf_step("reddit", "submit", "high")]) == {"s1": "policy"}
+
+
+def test_plan_step_confidence_defaults_high_for_legacy_state():
+    # Old persisted state_json predates the field — it must rebuild as "high".
+    step = PlanStep.model_validate({"id": "s1", "tool": "google", "action": "send_email"})
+    assert step.confidence == "high"
+
+
+def test_approval_draft_explains_low_confidence():
+    draft = _approval_draft(_plan([_conf_step("google", "send_email", "medium")]))
+    assert "Why am I being asked?" in draft.detail_markdown
+    assert "medium confidence" in draft.detail_markdown

@@ -10,9 +10,15 @@ pydantic-settings
 
 # LLM / orchestration
 langchain
-langgraph
+# Pinned range: interrupt()/Command resume + the __interrupt__ stream chunk are
+# relied on by the HITL flow; verified against 1.2.x.
+langgraph>=1.2,<2
 langchain-openai
 langchain-mcp-adapters
+# Durable LangGraph checkpoints (CHECKPOINTER_BACKEND=postgres). AsyncPostgresSaver
+# speaks psycopg v3 (NOT asyncpg, which SQLAlchemy keeps using) — two drivers, one DB.
+langgraph-checkpoint-postgres
+psycopg[binary]
 # Local-embeddings extras (langchain-huggingface, sentence-transformers, torch) live in
 # requirements-hf.txt, not here — only needed when EMBEDDING_PROVIDER=hf (default is
 # "openai" via the LiteLLM proxy). Keeping the ~2-3GB torch download out of the base

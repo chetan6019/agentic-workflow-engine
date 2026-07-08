@@ -3,18 +3,63 @@
 from __future__ import annotations
 
 from functools import lru_cache
-from typing import Literal
+from typing import Any, Literal
 
 import structlog
+from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, StateGraph
 
+from app.config import get_settings
 from app.core.state import AgentState
 from app.orchestration.nodes.guard import guardrails_node
 from app.orchestration.nodes.orchestrator import orchestrator_node
 from app.orchestration.nodes.planner import planner_node
 
 log = structlog.get_logger(__name__)
+
+# Module-level checkpointer. init_checkpointer() (called from the FastAPI lifespan)
+# swaps in the Postgres saver when CHECKPOINTER_BACKEND=postgres; until then
+# MemorySaver keeps tests and bare scripts working with zero setup.
+_checkpointer: BaseCheckpointSaver = MemorySaver()
+# Holds the AsyncPostgresSaver context manager so shutdown can close its pool.
+_saver_ctx: Any = None
+
+
+async def init_checkpointer() -> None:
+    """Open the durable Postgres checkpointer when configured; no-op on memory.
+
+    Must run AFTER init_db() (Postgres reachable). setup() creates LangGraph's own
+    checkpoint tables idempotently — they are deliberately outside Alembic because
+    the library owns their schema and migrations.
+    """
+    global _checkpointer, _saver_ctx
+    if get_settings().checkpointer_backend != "postgres":
+        log.info("checkpointer_memory")
+        return
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    # psycopg wants a plain postgresql:// DSN — strip SQLAlchemy's +asyncpg marker
+    # (same trick as app/data/db.py's raw-driver path).
+    dsn = get_settings().database_url.replace("+asyncpg", "")
+    _saver_ctx = AsyncPostgresSaver.from_conn_string(dsn)
+    saver = await _saver_ctx.__aenter__()
+    await saver.setup()
+    _checkpointer = saver
+    compile_graph.cache_clear()  # recompile against the durable saver
+    log.info("checkpointer_postgres_ready")
+
+
+async def close_checkpointer() -> None:
+    """Close the Postgres saver's pool on shutdown; best-effort, never raises."""
+    global _saver_ctx
+    if _saver_ctx is None:
+        return
+    try:
+        await _saver_ctx.__aexit__(None, None, None)
+    except Exception as exc:
+        log.warning("checkpointer_close_failed", error=str(exc))
+    _saver_ctx = None
 
 
 def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrails", "__end__"]:
@@ -27,8 +72,11 @@ def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrai
         dest: str = END
     elif state.plan is None:
         dest = "planner"
-    elif state.requires_approval and state.approval_token:
-        dest = END  # paused for HITL (plan-stage gate or calendar-conflict approval)
+    # STALE (2026-07-07): the route-to-END HITL pause is superseded by native
+    # interrupt() inside the nodes — a paused run never reaches this router, so
+    # the branch is dead. Kept per CLAUDE.md R13.
+    # elif state.requires_approval and state.approval_token:
+    #     dest = END  # paused for HITL (plan-stage gate or calendar-conflict approval)
     elif state.draft is not None and state.verdict is None:
         dest = "guardrails"
     else:
@@ -76,18 +124,25 @@ def _build_graph() -> StateGraph:
 
 @lru_cache(maxsize=1)
 def compile_graph():
-    """Return the compiled LangGraph singleton with an in-memory checkpointer."""
+    """Return the compiled LangGraph singleton bound to the active checkpointer.
+
+    init_checkpointer() clears this cache after swapping in the Postgres saver,
+    so anything compiled before the lifespan ran is recompiled on next use.
+    """
     log.info("graph_compiled")
-    return _build_graph().compile(checkpointer=MemorySaver())
+    return _build_graph().compile(checkpointer=_checkpointer)
 
 
 async def discard_thread(trace_id: str) -> None:
-    """Drop a run's in-memory checkpoints once its graph invocation has returned.
+    """Drop a TERMINAL run's checkpoints once its graph invocation has returned.
 
-    HITL resume rebuilds state from Postgres rather than the checkpoint (this build
-    routes to END and re-invokes instead of using LangGraph interrupt()), so a
-    thread's checkpoints are pure memory growth once the invocation completes.
-    Best-effort: a failure here must never fail the run.
+    Checkpoints are the HITL resume source now (native interrupt() + Command),
+    so callers must only discard after a run truly finishes — never while it is
+    paused awaiting approval. Best-effort: a failure here must never fail the run.
+    # STALE (2026-07-07): previous rationale — "HITL resume rebuilds state from
+    # Postgres rather than the checkpoint (this build routes to END and re-invokes
+    # instead of using LangGraph interrupt())" — superseded by the native
+    # interrupt() migration.
     """
     try:
         await compile_graph().checkpointer.adelete_thread(trace_id)

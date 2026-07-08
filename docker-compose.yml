@@ -228,6 +228,8 @@ services:
       MCP_REDDIT_URL: http://mcp-reddit:7006
       MCP_GITHUB_URL: http://mcp-github:7007
       MCP_GOOGLE_URL: http://mcp-google:7008
+      # Durable LangGraph checkpoints: paused HITL runs survive an api restart.
+      CHECKPOINTER_BACKEND: postgres
       TZ: ${TZ:-UTC}
       SERVICE_NAME: api
     depends_on:

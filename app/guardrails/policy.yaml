@@ -28,6 +28,13 @@ approval_required_actions:
   - reddit.post_comment
   - reddit.submit
 
+# Pre-execution confidence gate: planner steps self-rated at-or-below this level pause
+# for human approval BEFORE their tool runs — unless the step is a trusted read (see
+# trusted_read_actions below; reads never pause on confidence alone).
+#   medium = gate medium + low (default) · low = gate low only · off = disable
+# (approval_required_actions above always gates regardless of this knob.)
+confidence_gate_threshold: medium
+
 # Sending mail is approval-gated only when the recipient domain is NOT allowlisted.
 # STALE (2026-06-22): gmail namespace merged into the combined google MCP server.
 # email_send_action: gmail.send_email

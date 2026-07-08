@@ -34,6 +34,21 @@ def test_guard_example_validates():
         {"tone_fit": 0.9, "hallucination_risk": 0.1, "instruction_adherence": 0.95}
     )
 
+def test_planner_prompt_demands_step_confidence():
+    # Rule 6: every step carries confidence high|medium|low, with calibration guidance.
+    from app.prompts import _PLANNER_SYS
+    assert '"confidence": "high|medium|low"' in _PLANNER_SYS
+    assert "never inflate to high" in _PLANNER_SYS.lower()
+
+
+def test_planner_step_with_confidence_validates():
+    from app.core.state import PlanStep
+    step = PlanStep.model_validate({"id": "s1", "tool": "google", "action": "send_email",
+                                    "arguments": {}, "depends_on": [],
+                                    "confidence": "medium"})
+    assert step.confidence == "medium"
+
+
 def test_composer_example_validates():
     DraftResponse.model_validate({
         "summary": "Sent the email.",

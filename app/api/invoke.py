@@ -36,8 +36,11 @@ router = APIRouter(prefix="/v1")
 # across a restart of that instance. Two guards bound the blast radius: a per-run
 # timeout (run_timeout_sec) marks a hung run failed in process, and
 # /invoke/result reconciles a run whose phase key has vanished (worker gone) to a
-# failed state. Approval RESUME is restart-tolerant because it rebuilds from
-# Postgres and can land on any instance.
+# failed state. Approval RESUME is restart-tolerant because the paused run's
+# LangGraph checkpoint lives in Postgres (CHECKPOINTER_BACKEND=postgres) and
+# Command(resume=...) can land on any instance.
+# STALE (2026-07-07): previous wording — "because it rebuilds from Postgres" —
+# described the retired route-to-END mechanism; superseded by native interrupt().
 
 
 class InvokeRequest(BaseModel):
@@ -117,6 +120,14 @@ async def _set_phase(trace_id: str, label: str, owner: str,
     await get_redis().set(_PHASE_KEY.format(trace_id=trace_id), payload, ex=_PHASE_TTL)
 
 
+class _RunHolder:
+    """Mutable view of a streaming run: latest state + whether it paused for HITL."""
+
+    def __init__(self, state: AgentState) -> None:
+        self.state = state
+        self.paused = False
+
+
 async def _run_workflow_with_phase(initial: AgentState) -> None:
     """Run the graph in the background, updating Redis phase + persisting the state."""
     compiled = compile_graph()
@@ -124,15 +135,20 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     owner = initial.user_id
     log.info("workflow_run_start", trace_id=initial.trace_id, user_id=owner)
     started = time.monotonic()
-    holder = {"state": initial}  # mutable so a timeout still sees the latest state
+    # holder is mutable so a timeout still sees the latest state; "paused" flips when
+    # the stream yields the __interrupt__ frame (a node called interrupt() for HITL).
+    holder = _RunHolder(initial)
 
     async def _stream() -> None:
         async for chunk in compiled.astream(initial, config=config, stream_mode="values"):
+            if isinstance(chunk, dict) and "__interrupt__" in chunk:
+                holder.paused = True
+                continue
             try:
-                holder["state"] = AgentState.model_validate(chunk)
+                holder.state = AgentState.model_validate(chunk)
             except Exception:
                 continue
-            await _set_phase(initial.trace_id, _phase_label(holder["state"]), owner)
+            await _set_phase(initial.trace_id, _phase_label(holder.state), owner)
 
     await _set_phase(initial.trace_id, "📥 retrieving context", owner)
     try:
@@ -140,11 +156,21 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
     except asyncio.TimeoutError:
         log.error("workflow_run_timeout", trace_id=initial.trace_id,
                   timeout_sec=get_settings().run_timeout_sec)
-        holder["state"].error = holder["state"].error or "run_timeout"
+        holder.state.error = holder.state.error or "run_timeout"
     except Exception as exc:
         log.exception("workflow_run_failed", trace_id=initial.trace_id, error=str(exc))
-        holder["state"].error = holder["state"].error or str(exc)
-    final_state = holder["state"]
+        holder.state.error = holder.state.error or str(exc)
+    final_state = holder.state
+    if holder.paused:
+        # Paused for HITL. The interrupted node already persisted the approval draft +
+        # token to Postgres itself; the last streamed state PREDATES the pause, so
+        # saving it here would clobber that. Keep the checkpoint — it is the resume
+        # source (Command(resume=...)) and, on the postgres backend, survives restarts.
+        await _set_phase(initial.trace_id, "🛑 awaiting approval", owner, done=True)
+        workflow_run_latency_seconds.labels(outcome="paused").observe(
+            time.monotonic() - started)
+        log.info("workflow_run_paused", trace_id=initial.trace_id)
+        return
     try:
         await save_plan(final_state)
     except Exception as exc:
@@ -156,8 +182,7 @@ async def _run_workflow_with_phase(initial: AgentState) -> None:
         except Exception as exc:
             log.warning("assistant_message_persist_failed",
                         trace_id=initial.trace_id, error=str(exc))
-    # State is now in Postgres; drop the in-memory checkpoint (resume rebuilds
-    # from Postgres, so it's never read again — see discard_thread).
+    # Terminal run (paused runs returned above): the checkpoint is no longer needed.
     await discard_thread(initial.trace_id)
     await _set_phase(initial.trace_id, _phase_label(final_state), owner, done=True)
     elapsed = time.monotonic() - started
