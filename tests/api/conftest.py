@@ -130,7 +130,7 @@ def backend(monkeypatch) -> Backend:
         async def aget_state(self, config: Any) -> Any:
             # A paused thread always has a pending interrupted node in these tests.
             from types import SimpleNamespace as _NS
-            return _NS(next=("orchestrator",))
+            return _NS(next=("execute",))
 
         async def ainvoke(self, cmd: Any, config: Any = None) -> Any:
             # Resume arrives as Command(resume={"decision": ..., "edited_draft": ...}).

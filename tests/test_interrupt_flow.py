@@ -1,8 +1,9 @@
 """End-to-end interrupt()/Command(resume) flow on a REAL compiled graph.
 
-The graph is compiled fresh on a MemorySaver with the orchestrator/guard
-collaborators faked (no LLM, DB, Redis, MCP). These tests pin the properties
-the native-interrupt migration must guarantee:
+The graph is compiled fresh on a MemorySaver with each node's collaborators
+faked (no LLM, DB, Redis, MCP); only the planner node is replaced by a
+passthrough, since the seeded state already carries the plan under test.
+These tests pin the properties the native-interrupt migration must guarantee:
 
 - a gated step pauses BEFORE its tool runs;
 - resume replays the node without duplicating side effects (one approval token,
@@ -28,7 +29,11 @@ from app.core.state import (
     ToolResult,
 )
 from app.orchestration import graph
-from app.orchestration.nodes import guard, orchestrator
+from app.orchestration.nodes import compose as node_compose
+from app.orchestration.nodes import execute, guard
+from app.orchestration.nodes import intake as node_intake
+from app.orchestration.nodes import respond as node_respond
+from app.orchestration.nodes import retrieve as node_retrieve
 
 
 def _plan(tool: str, action: str, confidence: str = "high", **arguments: Any) -> ExecutionPlan:
@@ -40,7 +45,7 @@ def _plan(tool: str, action: str, confidence: str = "high", **arguments: Any) ->
 
 def _state(plan: ExecutionPlan) -> AgentState:
     return AgentState(trace_id="t-int", user_id="u", session_id="s",
-                      user_request="do the thing", plan=plan, phase="execute")
+                      user_request="do the thing", plan=plan)
 
 
 class FakeMCP:
@@ -101,12 +106,27 @@ def wired(monkeypatch):
         return SimpleNamespace(text=text, allowed=True, requires_approval=False,
                                blocked_rules=[], hits=[])
 
-    monkeypatch.setattr(orchestrator, "save_plan", fake_save_plan)
-    monkeypatch.setattr(orchestrator, "save_tool_call", fake_save_tool_call)
-    monkeypatch.setattr(orchestrator, "get_or_create_approval", fake_get_or_create)
-    monkeypatch.setattr(orchestrator, "get_mcp_client", lambda: rec.mcp)
-    monkeypatch.setattr(orchestrator, "compose", fake_compose)
-    monkeypatch.setattr(orchestrator, "spawn", lambda coro: coro.close())
+    async def fake_get_session(session_id):
+        return {"session_id": session_id}
+
+    async def fake_retrieve(state):
+        return []
+
+    async def passthrough_planner_node(state):
+        # The seeded state already carries the plan under test — no LLM needed.
+        return state
+
+    monkeypatch.setattr(node_intake, "get_session", fake_get_session)
+    monkeypatch.setattr(node_retrieve, "retrieve", fake_retrieve)
+    monkeypatch.setattr(graph, "planner_node", passthrough_planner_node)
+    monkeypatch.setattr(execute, "save_plan", fake_save_plan)
+    monkeypatch.setattr(execute, "save_tool_call", fake_save_tool_call)
+    monkeypatch.setattr(execute, "get_or_create_approval", fake_get_or_create)
+    monkeypatch.setattr(execute, "get_mcp_client", lambda: rec.mcp)
+    monkeypatch.setattr(node_compose, "compose", fake_compose)
+    monkeypatch.setattr(node_compose, "save_plan", fake_save_plan)
+    monkeypatch.setattr(node_respond, "save_plan", fake_save_plan)
+    monkeypatch.setattr(node_respond, "spawn", lambda coro: coro.close())
     monkeypatch.setattr(guard, "save_plan", fake_save_plan)
     monkeypatch.setattr(guard, "get_token", fake_get_token)
     monkeypatch.setattr(guard, "get_structured_llm", lambda *a, **k: _Judge())

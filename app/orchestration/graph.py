@@ -12,9 +12,13 @@ from langgraph.graph import END, StateGraph
 
 from app.config import get_settings
 from app.core.state import AgentState
+from app.orchestration.nodes.compose import compose_node
+from app.orchestration.nodes.execute import execute_node
 from app.orchestration.nodes.guard import guardrails_node
-from app.orchestration.nodes.orchestrator import orchestrator_node
+from app.orchestration.nodes.intake import intake_node
 from app.orchestration.nodes.planner import planner_node
+from app.orchestration.nodes.respond import respond_node
+from app.orchestration.nodes.retrieve import retrieve_node
 
 log = structlog.get_logger(__name__)
 
@@ -62,38 +66,63 @@ async def close_checkpointer() -> None:
     _saver_ctx = None
 
 
-def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrails", "__end__"]:
-    """Route to planner before a plan exists, to guardrails once an unscored draft exists.
+# STALE (2026-07-12): _route_after_orchestrator retired with the phase-dispatch
+# orchestrator node — the v9 explicit-node topology routes with plain per-stage
+# edges below (docs/langgraph_topology_v9.dot). Kept per CLAUDE.md R13.
+# def _route_after_orchestrator(state: AgentState) -> Literal["planner", "guardrails", "__end__"]:
+#     """Route to planner before a plan exists, to guardrails once an unscored draft exists."""
+#     if state.error:
+#         dest: str = END
+#     elif state.plan is None:
+#         dest = "planner"
+#     elif state.draft is not None and state.verdict is None:
+#         dest = "guardrails"
+#     else:
+#         dest = END
+#     return dest
 
-    Pure: reads state only. ``verdict is None`` means guardrails hasn't run yet, so a
-    fresh draft is sent there to be scored; once a verdict exists the run is done.
+
+# Every stage router below is pure (reads state only, R6). Any node that set
+# state.error routes straight to END; otherwise the run advances to the next stage.
+
+
+def _route_after_intake(state: AgentState) -> Literal["retrieve", "__end__"]:
+    """intake → retrieve, unless the node recorded an error."""
+    return END if state.error else "retrieve"  # type: ignore[return-value]
+
+
+def _route_after_retrieve(state: AgentState) -> Literal["plan", "__end__"]:
+    """retrieve → plan, unless the node recorded an error."""
+    return END if state.error else "plan"  # type: ignore[return-value]
+
+
+def _route_after_plan(state: AgentState) -> Literal["execute", "__end__"]:
+    """plan → execute, unless the planner recorded an error."""
+    return END if state.error else "execute"  # type: ignore[return-value]
+
+
+def _route_after_execute(state: AgentState) -> Literal["compose", "__end__"]:
+    """execute → compose, unless the node recorded an error (incl. a user rejection)."""
+    return END if state.error else "compose"  # type: ignore[return-value]
+
+
+def _route_after_compose(state: AgentState) -> Literal["guard", "__end__"]:
+    """compose → guard, unless the node recorded an error."""
+    return END if state.error else "guard"  # type: ignore[return-value]
+
+
+def _route_after_guard(state: AgentState) -> Literal["plan", "respond", "__end__"]:
+    """Map the verdict guardrails_node set onto a destination — pure, no mutation (R6).
+
+    "replan" returns to plan directly, SKIPPING retrieve: state.retrieved_plans is
+    already populated and re-retrieving would waste LLM calls (v9 note 4).
     """
     if state.error:
         dest: str = END
-    elif state.plan is None:
-        dest = "planner"
-    # STALE (2026-07-07): the route-to-END HITL pause is superseded by native
-    # interrupt() inside the nodes — a paused run never reaches this router, so
-    # the branch is dead. Kept per CLAUDE.md R13.
-    # elif state.requires_approval and state.approval_token:
-    #     dest = END  # paused for HITL (plan-stage gate or calendar-conflict approval)
-    elif state.draft is not None and state.verdict is None:
-        dest = "guardrails"
-    else:
-        dest = END
-    log.debug("route_after_orchestrator", dest=dest, has_plan=state.plan is not None,
-              has_draft=state.draft is not None, error=state.error)
-    return dest  # type: ignore[return-value]
-
-
-def _route_after_guard(state: AgentState) -> Literal["planner", "orchestrator", "__end__"]:
-    """Map the verdict guardrails_node set onto a destination — pure, no mutation (R6)."""
-    if state.error:
-        dest: str = END
     elif state.verdict == "finalize":
-        dest = "orchestrator"  # proceed to finalize/persist
+        dest = "respond"  # proceed to persist + index
     elif state.verdict == "replan":
-        dest = "planner"
+        dest = "plan"
     else:  # "hitl", "block", or None — nothing left to run in the graph
         dest = END
     log.info("route_after_guard", dest=dest, verdict=state.verdict,
@@ -102,23 +131,29 @@ def _route_after_guard(state: AgentState) -> Literal["planner", "orchestrator", 
 
 
 def _build_graph() -> StateGraph:
-    """Assemble the StateGraph with all nodes and conditional edges."""
+    """Assemble the v9 StateGraph: one explicit node per stage, plain edges between them."""
     graph = StateGraph(AgentState)
-    graph.add_node("orchestrator", orchestrator_node)
-    graph.add_node("planner", planner_node)
-    graph.add_node("guardrails", guardrails_node)
-    graph.set_entry_point("orchestrator")
-    graph.add_conditional_edges(
-        "orchestrator",
-        _route_after_orchestrator,
-        {"planner": "planner", "guardrails": "guardrails", END: END},
-    )
-    graph.add_edge("planner", "orchestrator")
-    graph.add_conditional_edges(
-        "guardrails",
-        _route_after_guard,
-        {"planner": "planner", "orchestrator": "orchestrator", END: END},
-    )
+    graph.add_node("intake", intake_node)
+    graph.add_node("retrieve", retrieve_node)
+    graph.add_node("plan", planner_node)
+    graph.add_node("execute", execute_node)
+    graph.add_node("compose", compose_node)
+    graph.add_node("guard", guardrails_node)
+    graph.add_node("respond", respond_node)
+    graph.set_entry_point("intake")
+    graph.add_conditional_edges("intake", _route_after_intake,
+                                {"retrieve": "retrieve", END: END})
+    graph.add_conditional_edges("retrieve", _route_after_retrieve,
+                                {"plan": "plan", END: END})
+    graph.add_conditional_edges("plan", _route_after_plan,
+                                {"execute": "execute", END: END})
+    graph.add_conditional_edges("execute", _route_after_execute,
+                                {"compose": "compose", END: END})
+    graph.add_conditional_edges("compose", _route_after_compose,
+                                {"guard": "guard", END: END})
+    graph.add_conditional_edges("guard", _route_after_guard,
+                                {"plan": "plan", "respond": "respond", END: END})
+    graph.add_edge("respond", END)
     return graph
 
 

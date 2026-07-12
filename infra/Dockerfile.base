@@ -37,7 +37,10 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/opt/venv/bin:$PATH"
 
 # Runtime-only deps: curl for the healthcheck, tzdata for Asia/Kolkata-style TZ vars.
+# `upgrade` first: the floating python:slim tag lags Debian security fixes (e.g. the
+# curl/libcurl4 HIGH, 2026-07), which would fail CI's Trivy gate until upstream rebuilds.
 RUN apt-get update \
+ && apt-get upgrade -y \
  && apt-get install -y --no-install-recommends curl tzdata \
  && rm -rf /var/lib/apt/lists/*
 

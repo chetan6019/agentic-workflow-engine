@@ -26,7 +26,11 @@ psycopg[binary]
 # handshake failures on some networks/runners.
 
 # MCP servers
-fastmcp
+# Pinned: FastMCP 3.x enforces streamable-HTTP Host/Origin validation (localhost-only by
+# default), which 421s the api's calls by Docker service name — handled by
+# FASTMCP_HTTP_HOST_ORIGIN_PROTECTION=false in docker-compose.yml. Pin so a rebuild can't
+# silently jump versions and change transport behavior again.
+fastmcp==3.4.3
 PyGithub
 
 # Data stores

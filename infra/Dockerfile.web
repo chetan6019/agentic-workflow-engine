@@ -11,6 +11,11 @@ COPY web/ ./
 RUN npm run build
 
 FROM nginx:alpine
+# Upgrade OS packages to the latest patched versions in Alpine's repos: the floating
+# nginx:alpine tag often lags fixed CVEs (e.g. c-ares/libexpat HIGHs, 2026-07), which
+# fails CI's Trivy gate until upstream rebuilds. This keeps the scan green without
+# pinning digests by hand.
+RUN apk upgrade --no-cache
 COPY web/nginx.conf /etc/nginx/conf.d/default.conf
 COPY --from=build /web/dist /usr/share/nginx/html
 EXPOSE 80
