@@ -1,10 +1,10 @@
-"""Routing-band tests for the LangGraph conditional edges, plus DAG levelling.
+﻿"""Routing tests for the v9 explicit-node LangGraph edges, plus DAG levelling.
 
-The bands now live in ``guard._decide_verdict`` (which mutates state) and the graph
-routers are pure readers of ``state.verdict`` (REVIEW.md R6). So these tests cover two
-layers: ``_decide_verdict`` for the finalize / HITL / re-plan / block decision + its
-state changes, and the routers for the verdict → destination mapping. No LLM, DB, or
-compiled graph involved.
+The verdict bands live in ``guard.decide_verdict`` (which mutates state) and the graph
+routers are pure readers of ``state.error`` / ``state.verdict`` (REVIEW.md R6). These
+tests cover three layers: the per-stage error routers, ``decide_verdict`` for the
+finalize / HITL / re-plan / block decision + its state changes, and the execute-node
+gate helpers. No LLM, DB, or graph invocation involved.
 """
 
 from __future__ import annotations
@@ -14,9 +14,8 @@ from langgraph.graph import END
 
 from app.core.state import AgentState, DraftResponse, ExecutionPlan, PlanStep, ToolResult
 from app.orchestration import graph
-from app.orchestration.nodes import guard
-from app.orchestration.nodes import orchestrator
-from app.orchestration.nodes.orchestrator import _approval_draft, _needs_approval, _topo_levels
+from app.orchestration.nodes import execute, guard
+from app.orchestration.nodes.execute import _approval_draft, _needs_approval, _topo_levels
 
 
 def _plan(steps: list[PlanStep] | None = None) -> ExecutionPlan:
@@ -38,30 +37,28 @@ def _state(**overrides) -> AgentState:
     return AgentState(**base)
 
 
-# ── _route_after_orchestrator ────────────────────────────────────────────────
+# ── per-stage error routers (v9: any node that sets state.error goes to END) ─
+# STALE (2026-07-12): the _route_after_orchestrator tests were retired with the
+# phase-dispatch orchestrator node — the explicit-node routers below replace them.
 
 
-def test_orchestrator_error_routes_to_end():
-    assert graph._route_after_orchestrator(_state(error="boom")) == END
+@pytest.mark.parametrize(("router", "next_node"), [
+    (graph._route_after_intake, "retrieve"),
+    (graph._route_after_retrieve, "plan"),
+    (graph._route_after_plan, "execute"),
+    (graph._route_after_execute, "compose"),
+    (graph._route_after_compose, "guard"),
+])
+def test_stage_router_advances_or_ends_on_error(router, next_node):
+    assert router(_state()) == next_node
+    assert router(_state(error="boom")) == END
 
 
-def test_orchestrator_without_plan_routes_to_planner():
-    assert graph._route_after_orchestrator(_state()) == "planner"
-
-
-def test_orchestrator_hitl_pause_routes_to_end():
-    s = _state(plan=_plan(), requires_approval=True, approval_token="tok")
-    assert graph._route_after_orchestrator(s) == END
-
-
-def test_orchestrator_unscored_draft_routes_to_guardrails():
-    s = _state(plan=_plan(), draft=_draft())  # verdict defaults to None → unscored
-    assert graph._route_after_orchestrator(s) == "guardrails"
-
-
-def test_orchestrator_scored_draft_routes_to_end():
-    s = _state(plan=_plan(), draft=_draft(), verdict="finalize")
-    assert graph._route_after_orchestrator(s) == END
+def test_compiled_graph_has_the_seven_v9_nodes():
+    # The topology is the spec (docs/langgraph_topology_v9.dot): one node per stage.
+    compiled = graph._build_graph().compile()
+    expected = {"intake", "retrieve", "plan", "execute", "compose", "guard", "respond"}
+    assert expected.issubset(set(compiled.get_graph().nodes))
 
 
 # ── _route_after_guard (pure verdict → destination mapping) ───────────────────
@@ -71,12 +68,12 @@ def test_guard_error_routes_to_end():
     assert graph._route_after_guard(_state(error="boom", verdict="finalize")) == END
 
 
-def test_guard_finalize_routes_to_orchestrator():
-    assert graph._route_after_guard(_state(verdict="finalize")) == "orchestrator"
+def test_guard_finalize_routes_to_respond():
+    assert graph._route_after_guard(_state(verdict="finalize")) == "respond"
 
 
-def test_guard_replan_routes_to_planner():
-    assert graph._route_after_guard(_state(verdict="replan")) == "planner"
+def test_guard_replan_routes_to_plan_skipping_retrieve():
+    assert graph._route_after_guard(_state(verdict="replan")) == "plan"
 
 
 def test_guard_hitl_routes_to_end():
@@ -94,7 +91,6 @@ def test_decide_high_confidence_finalizes():
     s = _state(confidence=0.9)
     guard.decide_verdict(s)
     assert s.verdict == "finalize"
-    assert s.phase == "finalize"
 
 
 def test_decide_medium_band_finalizes_while_hitl_disabled():
@@ -155,7 +151,7 @@ def test_decide_noops_when_error_already_set():
     assert s.verdict is None  # router sends error states straight to END
 
 
-# ── _topo_levels (orchestrator DAG execution order) ──────────────────────────
+# ── _topo_levels (execute-node DAG execution order) ──────────────────────────
 
 
 def _step(sid: str, deps: list[str] | None = None) -> PlanStep:
@@ -227,41 +223,41 @@ def _conf_step(tool: str, action: str, confidence: str) -> PlanStep:
 
 
 def test_confidence_gate_pauses_medium_write():
-    reasons = orchestrator._steps_needing_approval(
+    reasons = execute._steps_needing_approval(
         [_conf_step("google", "send_email", "medium")])
     assert reasons == {"s1": "low_confidence"}
 
 
 def test_confidence_gate_lets_high_write_through():
-    assert orchestrator._steps_needing_approval(
+    assert execute._steps_needing_approval(
         [_conf_step("google", "send_email", "high")]) == {}
 
 
 def test_confidence_gate_never_pauses_trusted_reads():
     # finnhub.get_quote is in policy trusted_read_actions — low confidence is fine.
-    assert orchestrator._steps_needing_approval(
+    assert execute._steps_needing_approval(
         [_conf_step("finnhub", "get_quote", "low")]) == {}
 
 
 def test_policy_action_gates_even_at_high_confidence():
-    reasons = orchestrator._steps_needing_approval(
+    reasons = execute._steps_needing_approval(
         [_conf_step("google", "delete_event", "high")])
     assert reasons == {"s1": "policy"}
 
 
 def test_confidence_gate_threshold_low_ignores_medium(monkeypatch):
-    monkeypatch.setattr(orchestrator, "confidence_gate_threshold", lambda: "low")
-    assert orchestrator._steps_needing_approval(
+    monkeypatch.setattr(execute, "confidence_gate_threshold", lambda: "low")
+    assert execute._steps_needing_approval(
         [_conf_step("google", "send_email", "medium")]) == {}
-    assert orchestrator._steps_needing_approval(
+    assert execute._steps_needing_approval(
         [_conf_step("google", "send_email", "low")]) == {"s1": "low_confidence"}
 
 
 def test_confidence_gate_threshold_off_only_policy_gates(monkeypatch):
-    monkeypatch.setattr(orchestrator, "confidence_gate_threshold", lambda: "off")
-    assert orchestrator._steps_needing_approval(
+    monkeypatch.setattr(execute, "confidence_gate_threshold", lambda: "off")
+    assert execute._steps_needing_approval(
         [_conf_step("google", "send_email", "low")]) == {}
-    assert orchestrator._steps_needing_approval(
+    assert execute._steps_needing_approval(
         [_conf_step("reddit", "submit", "high")]) == {"s1": "policy"}
 
 

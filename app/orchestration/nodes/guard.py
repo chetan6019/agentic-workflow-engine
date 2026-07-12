@@ -189,7 +189,9 @@ def decide_verdict(state: AgentState) -> None:
             state.requires_approval = True
         else:
             state.verdict = "finalize"
-            state.phase = "finalize"
+            # STALE (2026-07-12): state.phase retired — the v9 explicit-node
+            # topology routes on state.verdict alone (guard → respond edge).
+            # state.phase = "finalize"
 
     elif state.retry_count < MAX_RETRIES:
         # Re-plan: clear plan/results/draft for fresh attempt. A replanned plan is a
@@ -267,8 +269,7 @@ async def guardrails_node(state: AgentState) -> AgentState:
         trace_id=state.trace_id,
         user_id=state.user_id,
         session_id=state.session_id,
-        node="guardrails",
-        
+        node="guard",
     ):
         start = time.monotonic()
         log.info("guardrails_node_start", trace_id=state.trace_id)
@@ -321,7 +322,7 @@ async def guardrails_node(state: AgentState) -> AgentState:
         
         # Metrics
         duration_ms = int((time.monotonic() - start) * 1000)
-        node_latency_seconds.labels(node="guardrails").observe(time.monotonic() - start)
+        node_latency_seconds.labels(node="guard").observe(time.monotonic() - start)
         log.info("guardrails_node_done", 
                 confidence=round(state.confidence, 3),
                 verdict=state.verdict, 

@@ -153,11 +153,15 @@ class AgentState(BaseModel):
     )
     retry_count: int = Field(default=0, ge=0, description="Number of planner retries used.")
     error: str | None = Field(default=None, description="Terminal error code if any.")
-    phase: Literal["entry", "execute", "finalize", "noop", "error"] = Field(
-        default="entry",
-        description="Explicit orchestrator phase, advanced by the nodes. Replaces the old "
-        "field-presence inference so dispatch never depends on sentinel values.",
-    )
+    # STALE (2026-07-12): phase retired — the v9 explicit-node topology (one graph node
+    # per stage, docs/langgraph_topology_v9.dot) routes with plain edges, so no node
+    # dispatches on a phase value. extra="ignore" keeps old persisted state_json (which
+    # still carries a "phase" key) rebuilding cleanly.
+    # phase: Literal["entry", "execute", "finalize", "noop", "error"] = Field(
+    #     default="entry",
+    #     description="Explicit orchestrator phase, advanced by the nodes. Replaces the old "
+    #     "field-presence inference so dispatch never depends on sentinel values.",
+    # )
     verdict: Literal["finalize", "hitl", "replan", "block"] | None = Field(
         default=None,
         description="Guardrails routing decision. Set by guardrails_node (with its state "

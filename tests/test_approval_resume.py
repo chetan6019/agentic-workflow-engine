@@ -6,7 +6,7 @@ interrupt() migration, resume means ``ainvoke(Command(resume=payload))`` on the
 paused thread; the fake graph records the Command so assertions inspect exactly
 what would be handed to LangGraph. (The old rebuild-state-and-reinvoke tests —
 reject-without-graph, API-side calendar rebook — died with that mechanism; the
-rebook now lives in the orchestrator and is covered by test_interrupt_flow.py.)
+rebook now lives in the execute node and is covered by test_interrupt_flow.py.)
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ def wired(monkeypatch):
     class _FakeCompiled:
         async def aget_state(self, config):
             # A resumable thread has a pending (interrupted) node in `next`.
-            nxt = ("orchestrator",) if calls.has_pending_node else ()
+            nxt = ("execute",) if calls.has_pending_node else ()
             return SimpleNamespace(next=nxt)
 
         async def ainvoke(self, cmd, config=None):

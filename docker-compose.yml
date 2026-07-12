@@ -153,6 +153,11 @@ services:
     restart: on-failure
     environment:
       SERVICE_NAME: mcp-finnhub
+      # FastMCP 3.x enforces Host/Origin (DNS-rebinding) validation on the streamable-HTTP
+      # transport, trusting only localhost by default — so the api calling us by our Docker
+      # service name gets HTTP 421 Misdirected Request. That protection targets browser DNS
+      # rebinding; server-to-server calls on the internal compose network don't need it. Off.
+      FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: "false"
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7005)))"]
       interval: 15s
@@ -170,6 +175,9 @@ services:
     restart: on-failure
     environment:
       SERVICE_NAME: mcp-reddit
+      # See mcp-finnhub above: disable FastMCP 3.x localhost-only host validation so the
+      # api can reach us by Docker service name without a 421 Misdirected Request.
+      FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: "false"
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7006)))"]
       interval: 15s
@@ -185,6 +193,11 @@ services:
     ports: ["7007:7007"]
     env_file: .env
     restart: on-failure
+    environment:
+      SERVICE_NAME: mcp-github
+      # See mcp-finnhub above: disable FastMCP 3.x localhost-only host validation so the
+      # api can reach us by Docker service name without a 421 Misdirected Request.
+      FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: "false"
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7007)))"]
       interval: 15s
@@ -202,6 +215,9 @@ services:
     restart: on-failure
     environment:
       SERVICE_NAME: mcp-google
+      # See mcp-finnhub above: disable FastMCP 3.x localhost-only host validation so the
+      # api can reach us by Docker service name without a 421 Misdirected Request.
+      FASTMCP_HTTP_HOST_ORIGIN_PROTECTION: "false"
     healthcheck:
       test: ["CMD", "python", "-c", "import socket,sys; s=socket.socket(); s.settimeout(3); sys.exit(s.connect_ex(('127.0.0.1',7008)))"]
       interval: 15s

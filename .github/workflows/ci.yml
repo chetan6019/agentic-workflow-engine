@@ -185,11 +185,18 @@ jobs:
             dockerfile: infra/Dockerfile.web
     steps:
       - uses: actions/checkout@v5
+      # driver: docker builds straight into the host daemon's image store, so the
+      # workflow-base image built below is visible to the service builds' FROM.
+      # The action's default docker-container driver keeps an ISOLATED store: the
+      # service builds couldn't see the loaded base image and fell through to
+      # docker.io/library/workflow-base:latest → "pull access denied /
+      # authorization failed" on every api/streamlit/mcp build.
       - uses: docker/setup-buildx-action@v3
+        with:
+          driver: docker
 
       # Every Python service image builds FROM workflow-base:latest, so build
-      # the base first (web is node+nginx and skips it). The gha cache (shared
-      # scope) makes repeats near-instant.
+      # the base first (web is node+nginx and skips it).
       - name: Build base image
         if: matrix.service != 'web'
         uses: docker/build-push-action@v6
@@ -199,8 +206,12 @@ jobs:
           push: false
           load: true
           tags: workflow-base:latest
-          cache-from: type=gha,scope=base
-          cache-to: type=gha,scope=base,mode=max
+          # STALE (2026-07-12): gha layer cache disabled — the docker driver (needed
+          # so service builds can see the locally built workflow-base image) does not
+          # support gha cache export. Restore via an oci-layout named build context
+          # if base-image visibility is ever solved on the docker-container driver.
+          # cache-from: type=gha,scope=base
+          # cache-to: type=gha,scope=base,mode=max
 
       - name: Build ${{ matrix.service }} image
         uses: docker/build-push-action@v6
@@ -210,8 +221,10 @@ jobs:
           push: false
           load: true
           tags: ci-${{ matrix.service }}:scan
-          cache-from: type=gha,scope=${{ matrix.service }}
-          cache-to: type=gha,scope=${{ matrix.service }},mode=max
+          # STALE (2026-07-12): see "Build base image" above — gha cache unsupported
+          # on the docker driver.
+          # cache-from: type=gha,scope=${{ matrix.service }}
+          # cache-to: type=gha,scope=${{ matrix.service }},mode=max
 
       - name: Trivy vulnerability scan
         uses: aquasecurity/trivy-action@master

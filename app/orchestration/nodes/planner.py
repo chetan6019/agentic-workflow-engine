@@ -252,10 +252,10 @@ async def planner_node(state: AgentState) -> AgentState:
          and the weekday reference table.
       3. Ask the LLM for a structured plan (with one schema retry).
       4. Validate the plan only references known tools (with one correction).
-      5. Stash the plan on state and advance the phase to "execute".
+      5. Stash the plan on state; the graph's plan → execute edge advances the run.
 
-    On RuntimeError we record state.error, set state.phase = "error", and
-    return — the graph routes to the error handler from there. Other
+    On RuntimeError we record state.error and return — the graph routes
+    straight to END from there (v9 error routing). Other
     exception types are deliberately NOT caught; we want truly unexpected
     failures to propagate with their original traceback intact.
 
@@ -267,7 +267,7 @@ async def planner_node(state: AgentState) -> AgentState:
         trace_id=state.trace_id,
         user_id=state.user_id,
         session_id=state.session_id,
-        node="planner",
+        node="plan",
     ):
         start_time = time.monotonic()
         log.info(
@@ -308,11 +308,12 @@ async def planner_node(state: AgentState) -> AgentState:
                 metadata=metadata,
             )
 
-            # Step 5: commit the plan + advance the phase. `verdict` is
-            # cleared so a stale guard verdict from an earlier run can't
-            # leak through into the next phase.
+            # Step 5: commit the plan. `verdict` is cleared so a stale guard
+            # verdict from an earlier run can't leak through into the next stage.
             state.plan = plan
-            state.phase = "execute"
+            # STALE (2026-07-12): state.phase retired — the v9 explicit-node
+            # topology routes with plain graph edges, not phase dispatch.
+            # state.phase = "execute"
             state.verdict = None
 
             # Record the outcome for the "plan validity" metric.
@@ -334,13 +335,14 @@ async def planner_node(state: AgentState) -> AgentState:
             # error handler. The traceback is preserved via `raise ... from`
             # at the original raise site.
             state.error = str(exc)
-            state.phase = "error"
+            # STALE (2026-07-12): state.phase retired — see Step 5 above.
+            # state.phase = "error"
             planner_outcome_total.labels(outcome="failed").inc()
             log.error("planner_node_failed", error=str(exc))
         finally:
             # Observe latency on BOTH success and failure paths so error
             # latencies aren't silently excluded from the histogram.
             duration = time.monotonic() - start_time
-            node_latency_seconds.labels(node="planner").observe(duration)
+            node_latency_seconds.labels(node="plan").observe(duration)
 
         return state
